@@ -137,6 +137,9 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+if _is_npu:
+    import torch_npu
+
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
 
@@ -1727,12 +1730,22 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
-        return self.model.forward(
+
+        if _is_npu:
+            torch_npu.npu._subscribe_report(
+                torch.npu.current_stream()
+            )
+        output = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+        if _is_npu:
+            torch_npu.npu._unsubscribe_report(
+                torch.npu.current_stream()
+            )
+        return output
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

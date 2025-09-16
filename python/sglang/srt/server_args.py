@@ -132,6 +132,13 @@ def add_grammar_backend_choices(choices):
 class ServerArgs:
     # Model and tokenizer
     model_path: str
+    amx_weight_path: Optional[str] = None
+    amx_method: Optional[str] = None
+    cpu_embed: Optional[str] = None
+    cpuinfer: Optional[int] = None
+    subpool_count: Optional[int] = None
+    num_gpu_experts: Optional[int] = None
+    enable_defer: bool = False
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
@@ -623,6 +630,18 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        from sglang.srt.layers.quantization.w8a8_int8 import override_config
+        override_config(
+            self.num_gpu_experts,
+            self.cpuinfer,
+            self.subpool_count,
+            self.amx_weight_path,
+            self.amx_method,
+            self.chunked_prefill_size,
+            self.enable_defer,
+            self.cpu_embed
+        )
+
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -843,6 +862,44 @@ class ServerArgs:
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
+        )
+        parser.add_argument(
+            "--amx-weight-path",
+            type=str,
+            help="The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--amx-method",
+            type=str,
+            default="AMXINT4",
+            help="Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--cpu-embed",
+            type=str,
+            default=False,
+            help="Enable moving embed_token to cpu",
+        )
+        parser.add_argument(
+            "--cpuinfer",
+            type=int,
+            help="The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--subpool-count",
+            type=int,
+            default=2,
+            help="The number of NUMA nodes.",
+        )
+        parser.add_argument(
+            "--num-gpu-experts",
+            type=int,
+            help="The number of GPU experts.",
+        )
+        parser.add_argument(
+            "--enable-defer",
+            action="store_true",
+            help="Enable Expert Deferral.",
         )
         parser.add_argument(
             "--tokenizer-path",

@@ -59,7 +59,11 @@ from sglang.srt.utils import (
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
+    is_npu
 )
+
+if is_npu():
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +467,10 @@ class CudaGraphRunner:
         ), graph_capture() as graph_capture_context:
             with profile_context as prof:
                 self.stream = graph_capture_context.stream
+                if is_npu():
+                    torch_npu.npu._subscribe_report(
+                        torch.npu.current_stream()
+                    )
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
