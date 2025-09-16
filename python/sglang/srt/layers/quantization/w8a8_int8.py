@@ -90,21 +90,27 @@ if _is_npu:
     else:
         useMindIETurbo = True
 
-def override_config(num_gpu_experts, cpuinfer, subpool_count, amx_weight_path, amx_method, chunked_prefill_size, enable_defer, cpu_embed):
+def override_config(
+    num_gpu_experts, cpuinfer, subpool_count,
+    cpu_save, cpu_original_weight_path, cpu_weight_path,
+    cpu_method, chunked_prefill_size, enable_defer, cpu_embed):
     if num_gpu_experts is not None:
         os.environ['MOE_NUM_GPU_EXPERTS'] = str(num_gpu_experts)
     if cpuinfer is not None:
         os.environ['MOE_CPUINFER'] = str(cpuinfer)
     if subpool_count is not None:
         os.environ['SUBPOOL_COUNT'] = str(subpool_count)
-    if amx_weight_path is not None:
-        os.environ['MOE_AMX_WEIGHT_PATH'] = str(amx_weight_path)
-    if amx_method is not None:
-        os.environ['AMX_METHOD'] = str(amx_method)
+    if cpu_original_weight_path is not None:
+        os.environ['MOE_CPU_ORIGINAL_WEIGHT_PATH'] = str(cpu_original_weight_path)
+    if cpu_weight_path is not None:
+        os.environ['MOE_CPU_WEIGHT_PATH'] = str(cpu_weight_path)
+    if cpu_method is not None:
+        os.environ['MOE_CPU_METHOD'] = str(cpu_method)
     if cpu_embed is not None:
         os.environ['CPU_EMBED'] = str(cpu_embed)
     os.environ['MOE_CHUNKED_PREFILL_SIZE'] = str(chunked_prefill_size)
     os.environ['MOE_ENABLE_DEFER'] = str(enable_defer)
+    os.environ['MOE_CPU_SAVE'] = str(cpu_save)
 
 class KExpertsCPUBuffer():
     capture_bs: List = list()
@@ -533,12 +539,12 @@ class W8A8Int8Config(QuantizationConfig):
                     else NPU_W8A8LinearMethod(self)
                 )
             elif isinstance(layer, FusedMoE):
-                if os.environ.get('MOE_AMX_WEIGHT_PATH') is not None:
+                if os.environ.get('MOE_CPU_WEIGHT_PATH') is not None:
                     import re
                     match = re.search(r"(\d+)\.mlp", prefix)
                     assert match
                     layer_id = int(match.group(1))
-                    return NPU_W8A8AMXEPMoEMethod(self, layer_id)
+                    return NPU_W8A8CPUEPMoEMethod(self, layer_id)
                 else:
                     return NPU_W8A8MoEMethod(self)
             return None
@@ -1323,18 +1329,19 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         )
         return StandardCombineInput(hidden_states=output)
 
-class NPU_W8A8AMXMoEMethod(FusedMoEMethodBase):
+class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
     """Pure CPU inference W8A8 MoE method"""
     
     CPU_INFER = None
     SafeTensor_Loader = None
     
     def __init__(self, quant_config: W8A8Int8Config,
-                 layer_idx, num_gpu_experts, cpuinfer, subpool_count, amx_weight_path, chunked_prefill_size):
+                 layer_idx, num_gpu_experts, cpuinfer, subpool_count, 
+                 cpu_save, cpu_original_weight_path, cpu_weight_path, chunked_prefill_size):
         self.tp_rank = get_tensor_model_parallel_rank()
         if self.tp_rank != 0:
             return
-        if NPU_W8A8AMXMoEMethod.CPU_INFER is None:
+        if NPU_W8A8CPUMoEMethod.CPU_INFER is None:
             print(f"subpool count is {subpool_count}", flush=True)
             worker_config = cpuinfer_ext.WorkerPoolConfig()
             subpool_numa_map = list(range(subpool_count))
@@ -1346,20 +1353,30 @@ class NPU_W8A8AMXMoEMethod(FusedMoEMethodBase):
             worker_config.subpool_count = subpool_count
             worker_config.subpool_numa_map= subpool_numa_map
             worker_config.subpool_thread_count = subpool_thread_count
-            NPU_W8A8AMXMoEMethod.CPU_INFER = cpuinfer_ext.CPUInfer(worker_config)
-        self.cpu_infer = NPU_W8A8AMXMoEMethod.CPU_INFER
+            NPU_W8A8CPUMoEMethod.CPU_INFER = cpuinfer_ext.CPUInfer(worker_config)
+        self.cpu_infer = NPU_W8A8CPUMoEMethod.CPU_INFER
         # read safetensor weight
         self.load_merged_weight = False
-        if glob.glob(os.path.join(amx_weight_path, "*.safetensors")):
-            self.load_merged_weight = True
-        if self.load_merged_weight:
-            if NPU_W8A8AMXMoEMethod.SafeTensor_Loader is None:
-                NPU_W8A8AMXMoEMethod.SafeTensor_Loader = SafeTensorLoader(amx_weight_path)
-            self.safetensor_loader = NPU_W8A8AMXMoEMethod.SafeTensor_Loader
+        if cpu_save:
+            if glob.glob(os.path.join(cpu_original_weight_path, "*.safetensors")):
+                self.load_merged_weight = True
+            else:
+                raise RuntimeError(f"Cannot find safetensors in {cpu_original_weight_path} for cpu_save mode")
+            if NPU_W8A8CPUMoEMethod.SafeTensor_Loader is None:
+                NPU_W8A8CPUMoEMethod.SafeTensor_Loader = SafeTensorLoader(cpu_original_weight_path)
+            self.safetensor_loader = NPU_W8A8CPUMoEMethod.SafeTensor_Loader
+        else:
+            if glob.glob(os.path.join(cpu_weight_path, "*.safetensors")):
+                self.load_merged_weight = True
+            if self.load_merged_weight:
+                if NPU_W8A8CPUMoEMethod.SafeTensor_Loader is None:
+                    NPU_W8A8CPUMoEMethod.SafeTensor_Loader = SafeTensorLoader(cpu_weight_path)
+                self.safetensor_loader = NPU_W8A8CPUMoEMethod.SafeTensor_Loader
         self.layer_idx = layer_idx
         self.quant_config = quant_config
         self.num_gpu_experts = num_gpu_experts
-        self.amx_weight_path = amx_weight_path
+        self.cpu_save = cpu_save
+        self.cpu_weight_path = cpu_weight_path
         self.chunked_prefill_size = chunked_prefill_size
         
         if not CPUINFER_AVAILABLE:
@@ -1378,7 +1395,7 @@ class NPU_W8A8AMXMoEMethod(FusedMoEMethodBase):
             return
             
         # No GPU weights needed for pure CPU inference
-        logger.info(f"NPU_W8A8AMXMoEMethod creating weights for layer {self.layer_idx}")
+        logger.info(f"NPU_W8A8CPUMoEMethod creating weights for layer {self.layer_idx}")
     
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.tp_rank != 0:
@@ -1422,18 +1439,20 @@ class NPU_W8A8AMXMoEMethod(FusedMoEMethodBase):
             awq_moe_config.up_proj = up_proj_ptr
             awq_moe_config.down_proj = down_proj_ptr
 
-            awq_moe_config.save = True
-            awq_moe_config.load = False
-            # awq_moe_config.load = True
-            awq_moe_config.path = "/mnt/DeepSeek-R1-0528-W8A8-CPU-INT4"
+            if self.cpu_save:
+                awq_moe_config.save = True
+                awq_moe_config.load = False
+            else:
+                awq_moe_config.load = True
+            awq_moe_config.path = self.cpu_weight_path
         else:
             awq_moe_config.load = True
-            awq_moe_config.path = self.amx_weight_path
+            awq_moe_config.path = self.cpu_weight_path
 
         awq_moe_config.hidden_type = ggml_type.BF16
         awq_moe_config.output_type = ggml_type.FP32
 
-        self.moe = KMLInt8_MOE(awq_moe_config)
+        self.moe = KMLInt4_MOE(awq_moe_config)
 
         # from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
         # physical_to_logical_map_cpu = get_global_expert_location_metadata().physical_to_logical_map_cpu[self.layer_idx].contiguous()
@@ -1456,7 +1475,7 @@ class NPU_W8A8AMXMoEMethod(FusedMoEMethodBase):
 
             del w
 
-        logger.info(f"Loading W8A8 weights from {self.amx_weight_path} for layer {self.layer_idx}")
+        logger.info(f"Loading W8A8 weights from {self.cpu_weight_path} for layer {self.layer_idx}")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1469,28 +1488,30 @@ class NPU_W8A8AMXMoEMethod(FusedMoEMethodBase):
             dispatch_output: StandardDispatchOutput,
             **kwargs) -> torch.Tensor:
 
-        raise RuntimeError("NPU_W8A8AMXMoEMethod shouldn't be used directly.")
+        raise RuntimeError("NPU_W8A8CPUMoEMethod shouldn't be used directly.")
 
-class NPU_W8A8AMXEPMoEMethod(FusedMoEMethodBase):
+class NPU_W8A8CPUEPMoEMethod(FusedMoEMethodBase):
     """Expert Parallelism W8A* MoE method (CPU + GPU hybrid)"""
     
     def __init__(self, quant_config: W8A8Int8Config, layer_idx: int):
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        if 'MOE_NUM_GPU_EXPERTS' not in os.environ or 'MOE_CPUINFER' not in os.environ or 'MOE_AMX_WEIGHT_PATH' not in os.environ:
-            raise RuntimeError("the following arguments are required: --amx-weight-path, --cpuinfer, --num-gpu-experts")
+        if 'MOE_NUM_GPU_EXPERTS' not in os.environ or 'MOE_CPUINFER' not in os.environ or 'MOE_CPU_WEIGHT_PATH' not in os.environ:
+            raise RuntimeError("the following arguments are required: --cpu-weight-path, --cpuinfer, --num-gpu-experts")
         
         self.num_gpu_experts = int(os.environ.get('MOE_NUM_GPU_EXPERTS'))
         self.enable_defer = os.environ.get("MOE_ENABLE_DEFER", "False").lower() == "true"
         cpuinfer = int(os.environ.get('MOE_CPUINFER'))
-        amx_weight_path = os.environ.get('MOE_AMX_WEIGHT_PATH', '')
+        cpu_save = os.environ.get('MOE_CPU_SAVE', 'False').lower() == 'true'
+        cpu_original_weight_path = os.environ.get('MOE_CPU_ORIGINAL_WEIGHT_PATH', '')
+        cpu_weight_path = os.environ.get('MOE_CPU_WEIGHT_PATH', '')
         subpool_count = int(os.environ.get('SUBPOOL_COUNT'))
         chunked_prefill_size = int(os.environ.get('MOE_CHUNKED_PREFILL_SIZE', 8192))
         
         # Create CPU and GPU methods
-        self.cpu_method = NPU_W8A8AMXMoEMethod(
+        self.cpu_method = NPU_W8A8CPUMoEMethod(
             quant_config, layer_idx, self.num_gpu_experts, 
-            cpuinfer, subpool_count, amx_weight_path, chunked_prefill_size
+            cpuinfer, subpool_count, cpu_save, cpu_original_weight_path, cpu_weight_path, chunked_prefill_size
         )
         self.marlin_method = NPU_W8A8MoEMethod(quant_config, self.num_gpu_experts)
         self.layer_idx = layer_idx
@@ -1537,6 +1558,7 @@ class NPU_W8A8AMXEPMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
         **kwargs,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
@@ -1559,20 +1581,18 @@ class NPU_W8A8AMXEPMoEMethod(FusedMoEMethodBase):
                 self._submit_to_cpu,
                 self.moe_kexperts_param
             )
+        return StandardCombineInput(hidden_states=torch.zeros_like(x))
 
     def sync(self, x):
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        _, _, _, output_cpu, _, output_gpu = KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
-        if self.tp_rank == 0:
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._sync_to_cpu,
-                ()
-            )
-            output_gpu = output_cpu.to(device=x.device, non_blocking=True)
-            output = output_gpu.to(dtype=x.dtype)
-
-        return StandardCombineInput(hidden_states=output)
+        input_tensor_cpu, expert_ids_cpu, weights_cpu, output_cpu, bsz_tensor_cpu = KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
+        torch_npu.npu._launch_host_func(
+            torch.npu.current_stream(),
+            self._sync_to_cpu,
+            ()
+        )
+        output_gpu = output_cpu.to(device=x.device, non_blocking=True)
+        output = output_gpu.to(dtype=x.dtype)
+        return output
 
 
     def apply(

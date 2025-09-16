@@ -364,6 +364,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
+            model_config=self.config,
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],

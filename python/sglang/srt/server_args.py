@@ -132,8 +132,10 @@ def add_grammar_backend_choices(choices):
 class ServerArgs:
     # Model and tokenizer
     model_path: str
-    amx_weight_path: Optional[str] = None
-    amx_method: Optional[str] = None
+    cpu_save: Optional[bool] = None
+    cpu_original_weight_path: Optional[str] = None
+    cpu_weight_path: Optional[str] = None
+    cpu_method: Optional[str] = None
     cpu_embed: Optional[str] = None
     cpuinfer: Optional[int] = None
     subpool_count: Optional[int] = None
@@ -635,8 +637,10 @@ class ServerArgs:
             self.num_gpu_experts,
             self.cpuinfer,
             self.subpool_count,
-            self.amx_weight_path,
-            self.amx_method,
+            self.cpu_save,
+            self.cpu_original_weight_path,
+            self.cpu_weight_path,
+            self.cpu_method,
             self.chunked_prefill_size,
             self.enable_defer,
             self.cpu_embed
@@ -864,12 +868,22 @@ class ServerArgs:
             required=True,
         )
         parser.add_argument(
-            "--amx-weight-path",
-            type=str,
-            help="The path of the quantized expert weights for amx kernel. A local folder.",
+            "--cpu-save",
+            action="store_true",
+            help="The path of the quantized expert weights. A local folder.",
         )
         parser.add_argument(
-            "--amx-method",
+            "--cpu-original-weight-path",
+            type=str,
+            help="The path of the BF16 expert weights. A local folder.",
+        )
+        parser.add_argument(
+            "--cpu-weight-path",
+            type=str,
+            help="The path of the quantized expert weights. A local folder.",
+        )
+        parser.add_argument(
+            "--cpu-method",
             type=str,
             default="AMXINT4",
             help="Quantization formats for CPU execution.",

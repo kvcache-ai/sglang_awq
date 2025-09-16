@@ -213,6 +213,7 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.subscribe_stream = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -1731,20 +1732,18 @@ class ModelRunner:
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        if _is_npu:
+        if _is_npu and not self.subscribe_stream:
             torch_npu.npu._subscribe_report(
                 torch.npu.current_stream()
             )
+            self.subscribe_stream = True
         output = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
-        if _is_npu:
-            torch_npu.npu._unsubscribe_report(
-                torch.npu.current_stream()
-            )
+
         return output
 
     def forward_idle(

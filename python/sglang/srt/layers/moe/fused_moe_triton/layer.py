@@ -3,6 +3,7 @@
 import logging
 from enum import Enum
 from typing import List, Optional, Tuple
+import re
 
 import torch
 
@@ -120,9 +121,11 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configuration.
         inplace: suggestion to compute inplace (modify input activation).
     """
+    last_amx = None
 
     def __init__(
         self,
+        model_config,
         num_experts: int,
         hidden_size: int,
         intermediate_size: int,
@@ -230,6 +233,15 @@ class FusedMoE(torch.nn.Module):
                 self, prefix
             )
         assert self.quant_method is not None
+    
+        match = re.search(r"(\d+)\.mlp", prefix)
+        if match is None:
+            self.layer_idx = 0
+        else:
+            self.layer_idx = int(match.group(1))
+        if not hasattr(model_config, 'first_k_dense_replace'):
+            model_config.first_k_dense_replace = 0
+        self.defer_layers = list(range(model_config.first_k_dense_replace, model_config.num_hidden_layers-1))
 
         self.quant_method.create_weights(
             layer=self,
@@ -824,6 +836,8 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
+        res_hidden = None
+        final_hidden_states = None
 
         if self.moe_ep_size > 1 and not self.enable_flashinfer_cutlass_moe:
             if self.expert_map_cpu is not None and self.expert_map_gpu is None:
@@ -842,13 +856,32 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # TODO: consider using symmetric memory
-        combine_input = self.quant_method.apply(
-            layer=self,
-            dispatch_output=dispatch_output,
-        )
+        if hasattr(self.quant_method, "enable_defer") and self.quant_method.enable_defer and self.layer_idx-1 in self.defer_layers and self.moe_tp_rank == 0:
+            res_hidden = FusedMoE.last_amx.sync(hidden_states)
+
+        if hasattr(self.quant_method, "enable_defer") and self.quant_method.enable_defer and self.layer_idx in self.defer_layers and self.moe_tp_rank == 0:
+            FusedMoE.last_amx = self.quant_method
+            combine_input = self.quant_method.submit(
+                layer=self,
+                dispatch_output=dispatch_output,
+            )
+        else:
+            # TODO: consider using symmetric memory
+            combine_input = self.quant_method.apply(
+                layer=self,
+                dispatch_output=dispatch_output,
+            )
 
         final_hidden_states = self.dispatcher.combine(combine_input)
+
+        if res_hidden is not None:
+            if final_hidden_states is not None:
+                final_hidden_states += res_hidden
+            else:
+                final_hidden_states = res_hidden
+                
+        if final_hidden_states is None:
+            final_hidden_states = torch.zeros_like(hidden_states)
 
         final_hidden_states = final_hidden_states[
             ..., :origin_hidden_states_dim
