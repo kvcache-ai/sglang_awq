@@ -1009,54 +1009,6 @@ class ServerArgs:
             help="Enable Expert Deferral.",
         )
         parser.add_argument(
-            "--cpu-save",
-            action="store_true",
-            help="The path of the quantized expert weights. A local folder.",
-        )
-        parser.add_argument(
-            "--cpu-original-weight-path",
-            type=str,
-            help="The path of the BF16 expert weights. A local folder.",
-        )
-        parser.add_argument(
-            "--cpu-weight-path",
-            type=str,
-            help="The path of the quantized expert weights. A local folder.",
-        )
-        parser.add_argument(
-            "--cpu-method",
-            type=str,
-            default="AMXINT4",
-            help="Quantization formats for CPU execution.",
-        )
-        parser.add_argument(
-            "--cpu-embed",
-            type=str,
-            default=False,
-            help="Enable moving embed_token to cpu",
-        )
-        parser.add_argument(
-            "--cpuinfer",
-            type=int,
-            help="The number of CPUInfer threads.",
-        )
-        parser.add_argument(
-            "--subpool-count",
-            type=int,
-            default=2,
-            help="The number of NUMA nodes.",
-        )
-        parser.add_argument(
-            "--num-gpu-experts",
-            type=int,
-            help="The number of GPU experts.",
-        )
-        parser.add_argument(
-            "--enable-defer",
-            action="store_true",
-            help="Enable Expert Deferral.",
-        )
-        parser.add_argument(
             "--remote-instance-weight-loader-seed-instance-ip",
             type=str,
             default=ServerArgs.remote_instance_weight_loader_seed_instance_ip,
