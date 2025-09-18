@@ -120,7 +120,7 @@ class MambaAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if forward_mode.is_decode_or_idle():
-            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cuda"))
+            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, self.device))
         elif forward_mode.is_target_verify():
             self.query_start_loc_list[bs - 1].copy_(
                 torch.arange(
@@ -160,7 +160,7 @@ class MambaAttnBackend(AttentionBackend):
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
-            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, "cuda"))
+            self.query_start_loc_list[bs - 1].copy_(self._get_cached_arange(bs, self.device))
             if num_padding > 0:
                 self.query_start_loc_list[bs - 1][bs - num_padding :] = bs - num_padding
         elif forward_mode.is_target_verify():

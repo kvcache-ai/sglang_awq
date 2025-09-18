@@ -33,6 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.layers.cpuinfer import KExpertsCPUBuffer
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_rank,
@@ -286,6 +287,7 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        KExpertsCPUBuffer.capture_bs = [x * self.num_tokens_per_bs for x in self.capture_bs]
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:

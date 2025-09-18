@@ -683,7 +683,7 @@ class ServerArgs:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
 
-        from sglang.srt.layers.quantization.w8a8_int8 import override_config
+        from sglang.srt.layers.cpuinfer import override_config
         override_config(
             self.num_gpu_experts,
             self.cpuinfer,

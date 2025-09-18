@@ -217,7 +217,8 @@ class FusedMoE(torch.nn.Module):
 
         if quant_config is None:
             self.quant_method: FusedMoEMethodBase = UnquantizedFusedMoEMethod(
-                self.use_triton_kernels
+                self.use_triton_kernels,
+                self.layer_id
             )
         else:
             self.quant_method: FusedMoEMethodBase = quant_config.get_quant_method(
@@ -225,11 +226,6 @@ class FusedMoE(torch.nn.Module):
             )
         assert self.quant_method is not None
     
-        match = re.search(r"(\d+)\.mlp", prefix)
-        if match is None:
-            self.layer_idx = 0
-        else:
-            self.layer_idx = int(match.group(1))
         if not hasattr(model_config, 'first_k_dense_replace'):
             model_config.first_k_dense_replace = 0
         self.defer_layers = list(range(model_config.first_k_dense_replace, model_config.num_hidden_layers-1))
@@ -851,10 +847,10 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        if hasattr(self.quant_method, "enable_defer") and self.quant_method.enable_defer and self.layer_idx-1 in self.defer_layers and self.moe_tp_rank == 0:
+        if hasattr(self.quant_method, "enable_defer") and self.quant_method.enable_defer and self.layer_id-1 in self.defer_layers and self.moe_tp_rank == 0:
             res_hidden = FusedMoE.last_amx.sync(hidden_states)
 
-        if hasattr(self.quant_method, "enable_defer") and self.quant_method.enable_defer and self.layer_idx in self.defer_layers and self.moe_tp_rank == 0:
+        if hasattr(self.quant_method, "enable_defer") and self.quant_method.enable_defer and self.layer_id in self.defer_layers and self.moe_tp_rank == 0:
             FusedMoE.last_amx = self.quant_method
             combine_input = self.quant_method.submit(
                 layer=self,
