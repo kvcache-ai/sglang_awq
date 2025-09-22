@@ -1379,12 +1379,14 @@ class NPU_W8A8CPUEPMoEMethod(FusedMoEMethodBase):
 
 
             self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
-            
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._submit_to_cpu,
-                self.moe_kexperts_param
-            )
+            if torch.npu.is_current_stream_capturing():
+                torch_npu.npu._launch_host_func(
+                    torch.npu.current_stream(),
+                    self._submit_to_cpu,
+                    self.moe_kexperts_param
+                )
+            else:
+                self._submit_to_cpu(self.moe_kexperts_param)
         
         # GPU inference (sync)
         # topk_ids_npu = topk_ids.to(torch.int32)
@@ -1402,11 +1404,14 @@ class NPU_W8A8CPUEPMoEMethod(FusedMoEMethodBase):
 
         # Wait for CPU and combine results
         if self.tp_rank == 0:
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._sync_to_cpu,
-                ()
-            )
+            if torch.npu.is_current_stream_capturing():
+                torch_npu.npu._launch_host_func(
+                    torch.npu.current_stream(),
+                    self._sync_to_cpu,
+                    ()
+                )
+            else:
+                self._sync_to_cpu(())
             output_gpu = output_cpu.to(device=x.device, non_blocking=True)
             output = output_gpu.to(dtype=x.dtype)
 

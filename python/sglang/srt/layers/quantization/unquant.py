@@ -338,30 +338,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
         )
 
-    def _submit_cpu(
-        self,
-        x,
-        topk_weights,
-        topk_ids,
-    ):
-        if self.tp_rank == 0:
-            input_tensor_cpu, expert_ids_cpu, weights_cpu, output_cpu, bsz_tensor_cpu = \
-                KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
-            topk_ids_long = topk_ids.to(torch.int64)
-
-            input_tensor_cpu.copy_(x, non_blocking=True)
-            expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
-            weights_cpu.copy_(topk_weights, non_blocking=True)
-
-            print(f"input tensor ptr: {expert_ids_cpu.data_ptr()}", flush=True)
-
-            self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
-            
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._submit_to_cpu,
-                self.moe_kexperts_param
-            )
+    # def _submit_cpu(
+    #     self,
+    #     x,
+    #     topk_weights,
+    #     topk_ids,
+    # ):
+    #     if self.tp_rank == 0:
+    #         input_tensor_cpu, expert_ids_cpu, weights_cpu, output_cpu, bsz_tensor_cpu = \
+    #             KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
+    #         topk_ids_long = topk_ids.to(torch.int64)
+    #         input_tensor_cpu.copy_(x, non_blocking=True)
+    #         expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
+    #         weights_cpu.copy_(topk_weights, non_blocking=True)
+    #         self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)  
+    #         torch_npu.npu._launch_host_func(
+    #             torch.npu.current_stream(),
+    #             self._submit_to_cpu,
+    #             self.moe_kexperts_param
+    #         )
 
     def _sync_to_cpu(self, empty_param):
         self.cpu_method.cpu_infer.sync()
@@ -563,7 +558,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
             weights_cpu.copy_(topk_weights, non_blocking=True)
 
-
             self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
             
             torch_npu.npu._launch_host_func(
@@ -755,7 +749,6 @@ class CPUMoEMethod():
 
             if self.load_merged_weight:
                 base_key = f"model.layers.{self.layer_idx}"
-                # base_key = f"blk.{self.layer_idx}"
                 # Load pre-sliced NUMA experts
                 w = self.safetensor_loader.load_experts(base_key)
 

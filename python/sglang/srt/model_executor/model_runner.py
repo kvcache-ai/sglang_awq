@@ -1998,11 +1998,6 @@ class ModelRunner:
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        if _is_npu and not self.subscribe_stream:
-            torch_npu.npu._subscribe_report(
-                torch.npu.current_stream()
-            )
-            self.subscribe_stream = True
         output = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
