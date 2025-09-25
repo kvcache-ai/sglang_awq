@@ -559,12 +559,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             weights_cpu.copy_(topk_weights, non_blocking=True)
 
             self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
-            
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._submit_to_cpu,
-                self.moe_kexperts_param
-            )
+            if torch.npu.is_current_stream_capturing():
+                torch_npu.npu._launch_host_func(
+                    torch.npu.current_stream(),
+                    self._submit_to_cpu,
+                    self.moe_kexperts_param
+                )
+            else:
+                self._submit_to_cpu(self.moe_kexperts_param)
 
         if self.num_gpu_experts > 0:
             original_dtype = x.dtype
@@ -639,11 +641,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             final_hidden_states = None
 
         if self.cpu_method is not None and self.tp_rank == 0:
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._sync_to_cpu,
-                ()
-            )
+            if torch.npu.is_current_stream_capturing():
+                torch_npu.npu._launch_host_func(
+                    torch.npu.current_stream(),
+                    self._sync_to_cpu,
+                    ()
+                )
+            else:
+                self._sync_to_cpu(())
             output_gpu = output_cpu.to(device=x.device, non_blocking=True)
             output_cpuinfer = output_gpu.to(dtype=x.dtype)
             if final_hidden_states is None:
