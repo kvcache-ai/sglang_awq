@@ -63,21 +63,22 @@ _is_npu = is_npu()
 import triton
 import triton.language as tl
 
-class Qwen3MoeRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        Qwen3MoeRMSNorm is equivalent to T5LayerNorm
-        """
+class Qwen3NextRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, gate=None):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
 
 @triton.jit
 def fused_qkvzba_split_reshape_cat_kernel(
@@ -349,7 +350,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        self.norm = Qwen3MoeRMSNorm(self.head_v_dim,eps=self.layer_norm_epsilon)
+        self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -493,7 +494,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out)
+        core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
