@@ -39,6 +39,7 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.update_stream = torch.get_device_module(self.device).Stream()
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -54,9 +55,10 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _update_inputs(self, seq_lens):
-        self.graphs[self.bs].update(
-            cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
-        )
+        with torch.get_device_module(self.device).stream(self.update_stream):
+            self.graphs[self.bs].update(
+                cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
+            )
 
     def _cache_loc_dtype(self):
         return torch.int32
