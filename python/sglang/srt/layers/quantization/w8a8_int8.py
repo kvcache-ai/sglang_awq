@@ -73,7 +73,13 @@ if _is_npu:
         useMindIETurbo = False
     else:
         useMindIETurbo = True
-
+    
+    try:
+        import custom_ops
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
 
 # func refers to RMSNorm.__init__
 def npu_wrapper_rmsnorm_init(func):
@@ -123,6 +129,7 @@ def npu_fused_experts(
     w13_offset = kwargs.get("w13_offset", None)
     w2_offset = kwargs.get("w2_offset", None)
     use_wna16 = kwargs.get("use_wna16", False)
+    group_size = kwargs.get("group_size", 64)
 
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
@@ -160,16 +167,20 @@ def npu_fused_experts(
             "antiquant_offset": [w13_offset],
         }
 
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w13],
-        **scale_args13,
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )[0]
+    if useCustomOps:
+        hidden_states = custom_ops.npu_gmm_custom(hidden_states, w13, w13_scale, w13_offset, group_size, group_list=expert_tokens)
+    else:
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w13],
+            **scale_args13,
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=original_dtype,
+        )[0]
+
     # act_fn: swiglu
     hidden_states = torch_npu.npu_swiglu(hidden_states)
     if not use_wna16:
@@ -182,16 +193,19 @@ def npu_fused_experts(
     else:
         scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
     # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w2],
-        **scale_args2,
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )[0]
+    if useCustomOps:
+        hidden_states = custom_ops.npu_gmm_custom(hidden_states, w2, w2_scale, w2_offset, group_size, group_list=expert_tokens)
+    else:
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w2],
+            **scale_args2,
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=original_dtype,
+        )[0]
 
     final_hidden_states = torch_npu.npu_moe_finalize_routing(
         hidden_states,

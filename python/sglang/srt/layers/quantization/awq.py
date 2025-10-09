@@ -48,6 +48,12 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
+    try:
+        import custom_ops
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
 
 if _is_cuda:
     from sgl_kernel import (
@@ -891,17 +897,26 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
         w13_qweight_tmp.bitwise_xor_(0x88888888)
         w2_qweight_tmp.bitwise_xor_(0x88888888)
+        if useCustomOps:
+            w13_qweight_tmp = w13_qweight_tmp.reshape(w13_qweight_tmp.shape[0],w13_qweight_tmp.shape[1]//16,16,w13_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+            w2_qweight_tmp = w2_qweight_tmp.reshape(w2_qweight_tmp.shape[0],w2_qweight_tmp.shape[1]//16,16,w2_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
 
         w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
             layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
         w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+
         w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
             layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
         w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        if useCustomOps:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(torch.float16)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(torch.float16)
+        else:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
 
         layer.register_parameter(
             "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
@@ -950,5 +965,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
             use_wna16=True,
+            group_size=self.quant_config.group_size
         )
         return StandardCombineInput(hidden_states=output)
