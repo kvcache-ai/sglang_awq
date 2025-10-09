@@ -52,7 +52,12 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
-
+    try:
+        import custom_ops
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
 if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
@@ -1032,7 +1037,9 @@ def npu_fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
+    **kwargs,
 ):
+    group_size = kwargs.get("group_size", 64)
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
     scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
@@ -1057,31 +1064,37 @@ def npu_fused_experts(
     )
     expert_tokens = expert_tokens.to(torch.int64)
     # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w13],
-        antiquant_scale=[w13_scale],
-        antiquant_offset=[w13_offset],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )[0]
+    if useCustomOps:
+        hidden_states = custom_ops.npu_gmm_custom(hidden_states, w13, w13_scale, w13_offset, group_size, group_list=expert_tokens)
+    else:
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w13],
+            antiquant_scale=[w13_scale],
+            antiquant_offset=[w13_offset],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=original_dtype,
+        )[0]
     # act_fn: swiglu
     hidden_states = torch_npu.npu_swiglu(hidden_states)
     # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w2],
-        antiquant_scale=[w2_scale],
-        antiquant_offset=[w2_offset],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )[0]
+    if useCustomOps:
+        hidden_states = custom_ops.npu_gmm_custom(hidden_states, w2, w2_scale, w2_offset, group_size, group_list=expert_tokens)
+    else:
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w2],
+            antiquant_scale=[w2_scale],
+            antiquant_offset=[w2_offset],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=original_dtype,
+        )[0]
 
     final_hidden_states = torch_npu.npu_moe_finalize_routing(
         hidden_states,
@@ -1126,17 +1139,26 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
         w13_qweight_tmp.bitwise_xor_(0x88888888)
         w2_qweight_tmp.bitwise_xor_(0x88888888)
+        if useCustomOps:
+            w13_qweight_tmp = w13_qweight_tmp.reshape(w13_qweight_tmp.shape[0],w13_qweight_tmp.shape[1]//16,16,w13_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+            w2_qweight_tmp = w2_qweight_tmp.reshape(w2_qweight_tmp.shape[0],w2_qweight_tmp.shape[1]//16,16,w2_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
 
         w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
             layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
         w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+
         w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
             layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
         w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        if useCustomOps:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(torch.float16)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(torch.float16)
+        else:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
 
         layer.register_parameter(
             "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
@@ -1184,5 +1206,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
+            group_size=self.quant_config.group_size
         )
         return StandardCombineInput(hidden_states=output)
