@@ -33,13 +33,24 @@ if TYPE_CHECKING:
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
+from sglang.srt.utils import is_npu
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
+    from torch_npu.npu.graphs import _GraphDispatchMode
+    def _GraphDispatchMode__init__(self):
+        self.graph_dispatch_records = []
+        if not _GraphDispatchMode.update_stream:
+            _GraphDispatchMode.update_stream = torch_npu.npu.Stream()
+        self.update_stream = _GraphDispatchMode.update_stream
+
+    _GraphDispatchMode.__init__ = _GraphDispatchMode__init__
 
 class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.update_stream = torch.get_device_module(self.device).Stream()
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -55,10 +66,9 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _update_inputs(self, seq_lens):
-        with torch.get_device_module(self.device).stream(self.update_stream):
-            self.graphs[self.bs].update(
-                cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
-            )
+        self.graphs[self.bs].update(
+            cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
+        )
 
     def _cache_loc_dtype(self):
         return torch.int32
