@@ -4,7 +4,7 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
     BatchedPenalizerOrchestrator,
     _BatchedPenalizer,
 )
-
+from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):

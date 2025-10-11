@@ -828,8 +828,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):  
-        if self.num_gpu_experts!=-1: 
-            num_experts=self.num_gpu_experts
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
