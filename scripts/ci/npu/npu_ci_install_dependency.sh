@@ -7,22 +7,22 @@ OPTIONAL_DEPS="${2:-}"
 
 
 # Install the required dependencies in CI.
-apt update -y && apt install -y \
-    unzip \
-    build-essential \
-    cmake \
-    wget \
-    curl \
-    net-tools \
-    zlib1g-dev \
-    lld \
-    clang \
-    locales \
-    ccache \
-    ca-certificates \
-    libgl1 \
-    libglib2.0-0
-update-ca-certificates
+# apt update -y && apt install -y \
+#     unzip \
+#     build-essential \
+#     cmake \
+#     wget \
+#     curl \
+#     net-tools \
+#     zlib1g-dev \
+#     lld \
+#     clang \
+#     locales \
+#     ccache \
+#     ca-certificates \
+#     libgl1 \
+#     libglib2.0-0
+# update-ca-certificates
 ${PIP_INSTALL} --upgrade pip
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
 ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil

@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
+    CompressedTensorsWNA16MoEAscend,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
@@ -685,12 +686,16 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self)
             else:
-                if (
-                    self._is_dynamic_token_w4(weight_quant, input_quant)
-                    and input_quant is None
-                ):
-                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
-                    return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+                # if (
+                #     self._is_dynamic_token_w4(weight_quant, input_quant)
+                #     and input_quant is None
+                # ):
+                #     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
+                #     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+                logger.info_once(
+                    "Using CompressedTensorsWNA16MoEAscend"
+                )
+                return CompressedTensorsWNA16MoEAscend(self)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

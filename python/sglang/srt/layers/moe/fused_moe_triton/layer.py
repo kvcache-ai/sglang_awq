@@ -711,6 +711,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16MoEAscend",
                 ]
             )
             else loaded_weight

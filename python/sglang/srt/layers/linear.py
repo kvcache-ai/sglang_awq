@@ -166,6 +166,7 @@ class LinearBase(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
+        self.prefix = prefix
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
@@ -211,6 +212,7 @@ class ReplicatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        q_lora_rank: Optional[int] = None,
     ):
         super().__init__(
             input_size,
@@ -220,7 +222,7 @@ class ReplicatedLinear(LinearBase):
             quant_config,
             prefix=prefix,
         )
-
+        self.q_lora_rank = q_lora_rank
         # All the linear layer supports quant method.
         assert self.quant_method is not None
         self.quant_method.create_weights(

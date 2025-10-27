@@ -35,6 +35,8 @@ from sglang.srt.utils import (
     use_intel_xpu_backend,
 )
 
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_mla_preprocess_enabled
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -55,6 +57,8 @@ if _use_aiter:
     from aiter.tuned_gemm import tgemm
 
 if _is_npu:
+    import torch_npu
+    import custom_ops_qujing
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 try:
@@ -123,6 +127,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             ),
             requires_grad=False,
         )
+        if _is_npu and is_mla_preprocess_enabled():
+            if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+                layer.weightNz1 = custom_ops_qujing.npu_make_nz_subtensor(weight.data, 0, (input_size_per_partition, layer.q_lora_rank), (layer.q_lora_rank, 1))
+                layer.weightNz2 = custom_ops_qujing.npu_make_nz_subtensor(weight.data, input_size_per_partition * layer.q_lora_rank, (input_size_per_partition, sum(output_partition_sizes) - layer.q_lora_rank), (sum(output_partition_sizes) - layer.q_lora_rank, 1))
+            elif "q_b_proj" in layer.prefix:
+                layer.weightNz = custom_ops_qujing.npu_make_nz_subtensor(weight.data, 0, (input_size_per_partition, sum(output_partition_sizes)), (sum(output_partition_sizes), 1))
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -130,31 +140,53 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
-
+        
+        if _is_npu and is_mla_preprocess_enabled():
+            if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+                weight_tmp = layer.weight.data
+                weight_tmp1 = weight_tmp[: layer.q_lora_rank,:].transpose(0,1).contiguous()
+                weight_tmp2 = weight_tmp[layer.q_lora_rank :,:].transpose(0,1).contiguous()
+                weight_tmp1 = torch_npu.npu_format_cast(weight_tmp1, 29)
+                weight_tmp2 = torch_npu.npu_format_cast(weight_tmp2, 29)
+                layer.weightNz1.copy_(weight_tmp1)
+                layer.weightNz2.copy_(weight_tmp2)
+                # layer.weight = None
+            elif "q_b_proj" in layer.prefix:
+                weight_tmp = layer.weight.data.transpose(0,1).contiguous()
+                weight_tmp = torch_npu.npu_format_cast(weight_tmp, 29)
+                layer.weightNz.copy_(weight_tmp)
+                # layer.weight = None
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if use_intel_amx_backend(layer):
-            x_shapes = x.shape
-            if len(x_shapes) == 3:
-                x = x.view(-1, x.shape[-1])
-            output = torch.ops.sgl_kernel.weight_packed_linear(
-                x,
-                layer.weight,
-                bias,
-                True,  # is_vnni
-            )
-            if len(x_shapes) == 3:
-                output = output.view(x_shapes[0], x_shapes[1], -1)
-            return output
+        if _is_npu and is_mla_preprocess_enabled() and "fused_qkv_a_proj_with_mqa" in layer.prefix:
+            out1 = torch.matmul(x, layer.weightNz1)
+            out2 = torch.matmul(x, layer.weightNz2)
+            return torch.cat((out1, out2), dim=-1)            
+        elif _is_npu and is_mla_preprocess_enabled() and "q_b_proj" in layer.prefix:
+            return torch.matmul(x, layer.weightNz)
+        else:
+            if use_intel_amx_backend(layer):
+                x_shapes = x.shape
+                if len(x_shapes) == 3:
+                    x = x.view(-1, x.shape[-1])
+                output = torch.ops.sgl_kernel.weight_packed_linear(
+                    x,
+                    layer.weight,
+                    bias,
+                    True,  # is_vnni
+                )
+                if len(x_shapes) == 3:
+                    output = output.view(x_shapes[0], x_shapes[1], -1)
+                return output
 
-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
-            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+            elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+                return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
-        return F.linear(x, layer.weight, bias)
+            return F.linear(x, layer.weight, bias)
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):

@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+# import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -46,6 +47,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -172,6 +174,7 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
     )
+    import torch_npu
 else:
     pass
 
@@ -1136,6 +1139,7 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                q_lora_rank = self.q_lora_rank,
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -1406,14 +1410,13 @@ class DeepseekV2AttentionMLA(
                 layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
-            inner_state = forward_mla_prepare_npu(
-                self,
-                positions,
-                hidden_states,
-                forward_batch,
-                zero_allocator,
-                layer_scatter_modes,
-            )
+            if is_mla_preprocess_enabled():
+                inner_state = self.forward_npu_prepare_bf16(
+                    positions, hidden_states, forward_batch, zero_allocator)
+            else:
+                inner_state = forward_mla_prepare_npu(
+                    self, positions, hidden_states, forward_batch, zero_allocator, layer_scatter_modes
+                )                
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
                 self,
@@ -1454,6 +1457,47 @@ class DeepseekV2AttentionMLA(
             return forward_dsa_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
+
+    def forward_npu_prepare_bf16(self, positions, hidden_states, forward_batch, zero_allocator):
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+        slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int64)
+
+        (   q_nope_out,
+            q_rope_out,
+            k_cache,
+            v_cache,
+            _,
+            ) = torch_npu.npu_mla_prolog_v2(
+            hidden_states,
+            self.fused_qkv_a_proj_with_mqa.weightNz1,
+            self.q_b_proj.weightNz,
+            self.w_kc,
+            self.fused_qkv_a_proj_with_mqa.weightNz2,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            sin,
+            cos,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            rmsnorm_epsilon_cq = 1e-6,
+            rmsnorm_epsilon_ckv = 1e-6,
+            cache_mode="PA_BSND"
+        )
+        return (
+            q_rope_out,
+            v_cache,
+            q_nope_out,
+            k_cache,
+            forward_batch,
+            zero_allocator,
+            positions,
+            None,
+        )
 
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -2123,6 +2167,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+        # if dist.get_rank() == 0:
+        #     print(self.model)
 
     @property
     def routed_experts_weights_of_layer(self):
