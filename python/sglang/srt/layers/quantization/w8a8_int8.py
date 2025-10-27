@@ -56,9 +56,7 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-
 logger = logging.getLogger(__name__)
-
 
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Quantization.

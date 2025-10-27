@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+import custom_ops_qujing
 
 # region MHA
 def forward_mha_prepare_npu(
@@ -279,16 +280,19 @@ def forward_mla_core_npu(
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-        dtype=attn_output.dtype,
-        device=attn_output.device,
-    )
+    # attn_bmm_output = torch.empty(
+    #     (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+    #     dtype=attn_output.dtype,
+    #     device=attn_output.device,
+    # )
 
     attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    # torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
-    attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+    # attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+
+    attn_bmm_output = custom_ops_qujing.npu_bmm_transpose(attn_output, m.w_vc).view(-1, m.num_local_heads * m.v_head_dim)
+
     output, _ = m.o_proj(attn_bmm_output)
 
     return output

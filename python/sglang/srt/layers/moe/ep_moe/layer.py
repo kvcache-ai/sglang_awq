@@ -384,17 +384,17 @@ class DeepEPMoE(FusedMoE):
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
-                input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
-                if not input_quant and not isinstance(
-                    self.quant_method,
-                    (
-                        NPUCompressedTensorsW4A16Int4DynamicMoE,
-                        CompressedTensorsFusedMoEMethod,
-                    ),
-                ):
-                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
-                        hidden_states
-                    )
+                # input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
+                # if not input_quant and not isinstance(
+                #     self.quant_method,
+                #     (
+                #         NPUCompressedTensorsW4A16Int4DynamicMoE,
+                #         CompressedTensorsFusedMoEMethod,
+                #     ),
+                # ):
+                #     hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
+                #         hidden_states
+                #     )
                 hidden_states = self.quant_method.apply_without_routing_weights(
                     self,
                     hidden_states,

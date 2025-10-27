@@ -2,6 +2,8 @@ import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 
+from sglang.srt.utils import is_npu
+_is_npu = is_npu()
 
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     """
@@ -67,8 +69,12 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens += 1
 
     def _apply(self, logits: torch.Tensor):
-        mask = (self.len_output_tokens < self.min_new_tokens).expand_as(logits)
-        logits[mask] += self.stop_token_penalties[mask]
+        if _is_npu:
+            mask = (self.len_output_tokens < self.min_new_tokens).float().expand_as(logits)
+            logits += mask * self.stop_token_penalties
+        else:
+            mask = (self.len_output_tokens < self.min_new_tokens).expand_as(logits)
+            logits[mask] += self.stop_token_penalties[mask]
 
     def _filter(self, keep_indices: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[keep_indices]

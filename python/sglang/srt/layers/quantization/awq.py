@@ -58,6 +58,15 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
+    try:
+        import custom_ops_qujing
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
+    from sglang.srt.layers.quantization.awq_triton import (
+        awq_dequantize_decomposition as awq_dequantize,
+    )
 
 if _is_cuda:
     from sglang.jit_kernel.awq_dequantize import awq_dequantize
@@ -370,6 +379,8 @@ class AWQLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
+        self.mla_tag = quant_config.mla_tag
+        self.mla_q_lora_rank = quant_config.mla_q_lora_rank
 
     def create_weights(
         self,
@@ -409,19 +420,64 @@ class AWQLinearMethod(LinearMethodBase):
             packed_factor=self.quant_config.pack_factor,
             weight_loader=weight_loader,
         )
-
-        qzeros = PackedvLLMParameter(
-            data=torch.empty(
-                input_size_per_partition // self.quant_config.group_size,
-                output_size_per_partition // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            input_dim=0,
-            output_dim=1,
-            packed_dim=1,
-            packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
-        )
+        if not _is_npu:
+            qzeros = PackedvLLMParameter(
+                data=torch.empty(
+                    input_size_per_partition // self.quant_config.group_size,
+                    output_size_per_partition // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                weight_loader=weight_loader,
+            )
+        else:
+            if self.mla_tag is not None:
+                if self.mla_tag == "fused_qkv_a_proj_with_mqa":
+                    buff_weight1 = torch.empty(
+                        input_size_per_partition,
+                        self.mla_q_lora_rank,
+                        dtype=torch.bfloat16,
+                    )
+                    buff_weight1 = torch_npu.npu_format_cast(buff_weight1,29)
+                    layer.weight1 = buff_weight1
+                    buff_weight2 = torch.empty(
+                        input_size_per_partition,
+                        output_size_per_partition - self.mla_q_lora_rank,
+                        dtype=torch.bfloat16,
+                    )
+                    buff_weight2 = torch_npu.npu_format_cast(buff_weight2,29)
+                    layer.weight2 = buff_weight2
+                else:
+                    buff_weight = torch.empty(
+                        input_size_per_partition,
+                        output_size_per_partition,
+                        dtype=torch.bfloat16,
+                    )
+                    buff_weight = torch_npu.npu_format_cast(buff_weight,29)
+                    layer.weight = buff_weight
+            buff_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    input_size_per_partition // self.quant_config.group_size,
+                    output_size_per_partition,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("buff_qzeros", buff_qzeros)
+            qzeros = PackedvLLMParameter(
+                data=buff_qzeros.data.view(torch.int32).view(-1)[:buff_qzeros.data.numel()//8].view(
+                    input_size_per_partition // self.quant_config.group_size,
+                    output_size_per_partition // self.quant_config.pack_factor
+                ),
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                weight_loader=weight_loader,
+            )        
 
         scales = GroupQuantScaleParameter(
             data=torch.empty(
@@ -620,27 +676,46 @@ class AWQLinearAscendMethod(AWQLinearMethod):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        qweight_tmp = torch.zeros_like(layer.qweight.data)
-        qzeros_tmp = layer.qzeros.data
-        qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        if self.mla_tag is not None:
+            if self.mla_tag == "fused_qkv_a_proj_with_mqa":
+                weight_tmp = awq_dequantize(layer.qweight.data, layer.scales.data, layer.qzeros.data)
+                weight_tmp1 = weight_tmp[:, : self.mla_q_lora_rank].contiguous()
+                weight_tmp2 = weight_tmp[:, self.mla_q_lora_rank :].contiguous()
+                weight_tmp1 = torch_npu.npu_format_cast(weight_tmp1, 29)
+                weight_tmp2 = torch_npu.npu_format_cast(weight_tmp2, 29)
+                layer.weight1.copy_(weight_tmp1)
+                layer.weight2.copy_(weight_tmp2)
+            else:
+                weight_tmp = awq_dequantize(layer.qweight.data, layer.scales.data, layer.qzeros.data).contiguous()
+                weight_tmp = torch_npu.npu_format_cast(weight_tmp, 29)
+                layer.weight.copy_(weight_tmp)
+        else:
+            ###
+            qweight_tmp = layer.qweight.data.view(torch.uint8).view(-1,1)
+            shifter = torch.tensor([1, 16], dtype=torch.uint8, device=qweight_tmp.device)
+            qweight_tmp = (qweight_tmp // shifter)
+            qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+            qweight_tmp = qweight_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+            qweight_tmp = qweight_tmp[...,0] + qweight_tmp[...,1] * 16
+            qweight_tmp = qweight_tmp.view(torch.int32).view(layer.qweight.data.shape)
 
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(
-                ((layer.qweight.data >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
+            ###
+            qzeros_tmp = layer.qzeros.data.view(torch.int8).view(-1,1)
+            shifter = torch.tensor([1, 16], dtype=torch.int8, device=qzeros_tmp.device)
+            qzeros_tmp = (qzeros_tmp // shifter)
+            qzeros_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F)
+            qzeros_tmp = qzeros_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+            qzeros_tmp = -(qzeros_tmp - 8)
+            qzeros_tmp = qzeros_tmp.reshape(
+                layer.qzeros.shape[0], -1
             )
+            qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
-        qweight_tmp.bitwise_xor_(0x88888888)
-
-        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
-        qzeros_tmp = -(qzeros_tmp - 8)
-        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
-
-        layer.zeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.weight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+            layer.qweight.data = layer.qweight.data.view(qweight_tmp.shape).copy_(qweight_tmp)
+            layer.buff_qzeros.data = layer.buff_qzeros.data.view(qzeros_tmp.dtype).view(qzeros_tmp.shape).copy_(qzeros_tmp)
+            layer.register_parameter(
+                "qzeros", layer.buff_qzeros
+            )
 
     def apply(
         self,
@@ -648,24 +723,39 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qweight = layer.weight
-        scales = layer.scales
-        qzeros = layer.zeros
-        pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
-        reshaped_x = x.reshape(-1, x.shape[-1])
+        if self.mla_tag is not None:
+            if self.mla_tag == "fused_qkv_a_proj_with_mqa":
+                weight1 = layer.weight1
+                weight2 = layer.weight2
+                out_shape = x.shape[:-1] + (weight1.shape[-1] + weight2.shape[-1],)
+                reshaped_x = x.reshape(-1, x.shape[-1])
+                out1 = torch.matmul(reshaped_x, weight1)
+                out2 = torch.matmul(reshaped_x, weight2)
+                out = torch.cat((out1, out2), dim=-1)
+            else:
+                weight = layer.weight
+                out_shape = x.shape[:-1] + (weight.shape[-1],)
+                reshaped_x = x.reshape(-1, x.shape[-1])
+                out = torch.matmul(reshaped_x, weight)
+        else:
+            qweight = layer.qweight
+            scales = layer.scales
+            qzeros = layer.qzeros
+            pack_factor = self.quant_config.pack_factor
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            reshaped_x = x.reshape(-1, x.shape[-1])
 
-        if bias is not None and bias.dtype == torch.bfloat16:
-            bias = bias.float()
+            if bias is not None and bias.dtype == torch.bfloat16:
+                bias = bias.float()
 
-        out = torch_npu.npu_weight_quant_batchmatmul(
-            reshaped_x,
-            qweight,
-            antiquant_scale=scales,
-            antiquant_offset=qzeros,
-            antiquant_group_size=self.quant_config.group_size,
-            bias=bias,
-        )
+            out = torch_npu.npu_weight_quant_batchmatmul(
+                reshaped_x,
+                qweight,
+                antiquant_scale=scales,
+                antiquant_offset=qzeros,
+                antiquant_group_size=self.quant_config.group_size,
+                bias=bias,
+            )
 
         return out.reshape(out_shape)
 
@@ -721,8 +811,8 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
 
-        num_groups_w13 = hidden_size // self.quant_config.group_size
-        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size
+        num_groups_w13 = hidden_size // layer.group_size
+        num_groups_w2 = intermediate_size_per_partition // layer.group_size
 
         # WEIGHT_SCALES
         # Allocate 2 scales for w1 and w3 respectively.
@@ -747,29 +837,72 @@ class AWQMoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_ZERO_POINT
         # Allocate 2 zero points for w1 and w3 respectively.
-        w13_qzeros = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                num_groups_w13,
-                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_qzeros", w13_qzeros)
-        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+        if not _is_npu:
+            w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_qzeros", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
 
-        w2_qzeros = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                num_groups_w2,
-                hidden_size // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_qzeros", w2_qzeros)
-        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+            w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_qzeros", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
+        else:
+            buff_w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("buff_w13_qzeros", buff_w13_qzeros)
+            w13_qzeros = torch.nn.Parameter(
+                buff_w13_qzeros.data.view(torch.int32)[:num_experts // 4,...].view(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_qzeros", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+            buff_w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("buff_w2_qzeros", buff_w2_qzeros)
+            w2_qzeros = torch.nn.Parameter(
+                buff_w2_qzeros.data.view(torch.int32)[:num_experts // 4,...].view(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.quant_config.pack_factor,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_qzeros", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
@@ -868,60 +1001,193 @@ class AWQMoEAscendMethod(AWQMoEMethod):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
 
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        group_size = self.quant_config.group_size
+        group_size_div_factor = 1
+        while intermediate_size_per_partition % group_size or hidden_size % group_size:
+            group_size = group_size // 2
+            group_size_div_factor = group_size_div_factor * 2
+            assert group_size >= 32
+        layer.group_size = group_size
+        layer.group_size_div_factor = group_size_div_factor
+        assert "weight_loader" in extra_weight_attrs
+        weight_loader = extra_weight_attrs["weight_loader"]
+        wrapped_weight_loader = AWQMoEAscendMethod.get_weight_loader(layer, weight_loader)
+        extra_weight_attrs["weight_loader"] = wrapped_weight_loader 
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs
+        )
+    
+    @staticmethod
+    def get_weight_loader(layer, weight_loader):
+        def moe_awq_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ):
+            # repeat the qzeros/scales to fit new group size
+            if (
+                layer.group_size_div_factor > 1
+                and "qzeros" in weight_name
+                or "scales" in weight_name
+            ):
+                loaded_weight = loaded_weight.repeat_interleave(
+                    layer.group_size_div_factor, 0
+                )
+            weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
+
+        return moe_awq_weight_loader
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
-        w13_qzeros_list = []
-        w2_qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            w13_qzeros_list.append(
-                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w2_qzeros_list.append(
-                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w13_qweight_tmp.bitwise_or_(
-                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-            w2_qweight_tmp.bitwise_or_(
-                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
+        ###
+        w13_qweight_tmp = layer.w13_qweight.data.view(torch.uint8).view(-1,1)
+        shifter = torch.tensor([1, 16], dtype=torch.uint8, device=w13_qweight_tmp.device)
+        w13_qweight_tmp = (w13_qweight_tmp // shifter)
+        w13_qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+        w13_qweight_tmp = w13_qweight_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w13_qweight_tmp = w13_qweight_tmp[...,0] + w13_qweight_tmp[...,1] * 16
+        w13_qweight_tmp = w13_qweight_tmp.view(torch.int32).view(layer.w13_qweight.data.shape)
 
-        w13_qweight_tmp.bitwise_xor_(0x88888888)
-        w2_qweight_tmp.bitwise_xor_(0x88888888)
+        ###
+        w2_qweight_tmp = layer.w2_qweight.data.view(torch.uint8).view(-1,1)
+        # shifter = torch.tensor([1, 16], dtype=torch.uint8, device=w2_qweight_tmp.device)
+        w2_qweight_tmp = (w2_qweight_tmp // shifter)
+        w2_qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+        w2_qweight_tmp = w2_qweight_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w2_qweight_tmp = w2_qweight_tmp[...,0] + w2_qweight_tmp[...,1] * 16
+        w2_qweight_tmp = w2_qweight_tmp.view(torch.int32).view(layer.w2_qweight.data.shape)
 
-        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
+        if useCustomOps:
+            w13_qweight_tmp = w13_qweight_tmp.reshape(w13_qweight_tmp.shape[0],w13_qweight_tmp.shape[1]//16,16,w13_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+            w2_qweight_tmp = w2_qweight_tmp.reshape(w2_qweight_tmp.shape[0],w2_qweight_tmp.shape[1]//16,16,w2_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+
+        ###
+        w13_qzeros_tmp = layer.w13_qzeros.data.view(torch.int8).view(-1,1)
+        shifter = torch.tensor([1, 16], dtype=torch.int8, device=w13_qzeros_tmp.device)
+        w13_qzeros_tmp = (w13_qzeros_tmp // shifter)
+        w13_qzeros_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F)
+        w13_qzeros_tmp = w13_qzeros_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
+        w13_qzeros_tmp = w13_qzeros_tmp.reshape(
             layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
-        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
+
+        ###
+        w2_qzeros_tmp = layer.w2_qzeros.data.view(torch.int8).view(-1,1)
+        # shifter = torch.tensor([1, 16], dtype=torch.int8, device=w2_qzeros_tmp.device)
+        w2_qzeros_tmp = (w2_qzeros_tmp // shifter)
+        w2_qzeros_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F)
+        w2_qzeros_tmp = w2_qzeros_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
+        w2_qzeros_tmp = w2_qzeros_tmp.reshape(
             layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
-        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        if useCustomOps:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(torch.float16)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(torch.float16)
+        else:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+        
+        layer.w13_qweight.data = layer.w13_qweight.data.view(w13_qweight_tmp.shape).copy_(w13_qweight_tmp)
+        layer.w2_qweight.data = layer.w2_qweight.data.view(w2_qweight_tmp.shape).copy_(w2_qweight_tmp)
+        layer.buff_w13_qzeros.data = layer.buff_w13_qzeros.data.view(w13_qzeros_tmp.dtype).view(w13_qzeros_tmp.shape).copy_(w13_qzeros_tmp)
+        layer.buff_w2_qzeros.data = layer.buff_w2_qzeros.data.view(w2_qzeros_tmp.dtype).view(w2_qzeros_tmp.shape).copy_(w2_qzeros_tmp)
 
         layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
+            "w13_qzeros", layer.buff_w13_qzeros
         )
         layer.register_parameter(
-            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
+            "w2_qzeros", layer.buff_w2_qzeros
         )
-        layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-        )
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+
+    @staticmethod
+    def custom_moe(
+        hidden_states: torch.Tensor,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        w13_offset = kwargs.get("w13_offset", None)
+        w2_offset = kwargs.get("w2_offset", None)
+        group_size = kwargs.get("group_size", 64)
+
+        original_shape = hidden_states.shape
+        if len(original_shape) == 3:
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        if hidden_states.shape[0]==1:
+            final_hidden_states = custom_ops_qujing.npu_moe_ffn(hidden_states,
+                            w13, w13_scale,
+                            w2, w2_scale,
+                            topk_ids.view(-1),
+                            topk_ids.view(-1),
+                            topk_ids.view(-1,top_k),
+                            topk_weights,
+                            group_size,
+                            top_k,
+                            w13_offset=w13_offset,
+                            w2_offset=w2_offset)
+        else:
+            expanded_expert_idx, sorted_row_idx = torch.sort(topk_ids.view(-1).float())
+            _, expanded_row_idx = torch.sort(sorted_row_idx.float())
+            final_hidden_states = custom_ops_qujing.npu_moe_ffn(hidden_states,
+                                        w13, w13_scale,
+                                        w2, w2_scale,
+                                        expanded_expert_idx.int(),
+                                        (sorted_row_idx/top_k).int(),
+                                        expanded_row_idx.view(-1,top_k).int(),
+                                        topk_weights,
+                                        group_size,
+                                        top_k,
+                                        w13_offset=w13_offset,
+                                        w2_offset=w2_offset)
+        if len(original_shape) == 3:
+            final_hidden_states = final_hidden_states.view(original_shape)
+        return final_hidden_states
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ) -> torch.Tensor:
+        hidden_states = custom_ops_qujing.npu_moe_without_routing_ffn(hidden_states,
+                    layer.w13_qweight, layer.w13_scales,
+                    layer.w2_qweight, layer.w2_scales,
+                    group_list,
+                    layer.group_size,
+                    w13_offset=layer.w13_qzeros,
+                    w2_offset=layer.w2_qzeros)
+        return hidden_states
 
     def apply(
         self,
@@ -940,7 +1206,8 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
+        # output = npu_fused_experts(
+        output = AWQMoEAscendMethod.custom_moe(
             hidden_states=x,
             w13=layer.w13_qweight,
             w13_scale=layer.w13_scales,
@@ -952,6 +1219,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
             use_wna16=True,
+            group_size=layer.group_size
         )
         return StandardCombineInput(hidden_states=output)
 
