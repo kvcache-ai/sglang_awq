@@ -309,8 +309,8 @@ class Qwen3DecoderLayer(nn.Module):
             ),
         )
         hidden_states = self.mlp(hidden_states)
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
+        # if _is_npu and get_cmo_stream():
+        #     wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

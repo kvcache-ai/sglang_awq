@@ -202,8 +202,8 @@ class DeepseekV2WeightLoaderMixin:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
-                    if _is_npu:
-                        name = name.replace("weight_packed", "weight")
+                    # if _is_npu:
+                    #     name = name.replace("weight_packed", "weight")
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise
@@ -231,8 +231,8 @@ class DeepseekV2WeightLoaderMixin:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
+                        # if _is_npu:
+                        #     name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
                         if name not in params_dict:
                             continue
@@ -568,7 +568,7 @@ class DeepseekV2WeightLoaderMixin:
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                    self_attn.w_kc, w_kc.contiguous()#.transpose(1, 2).contiguous().transpose(1, 2)
                 )
                 w_vc = w_vc.contiguous().transpose(1, 2)
                 if _is_npu:

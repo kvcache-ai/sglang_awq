@@ -193,6 +193,7 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
     )
+    import torch_npu
 else:
     pass
 
@@ -223,7 +224,8 @@ class DeepseekV2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
-
+        if quant_config is not None:
+            quant_config.mla_tag = "shared_gate_up_proj"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -233,6 +235,8 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        if quant_config is not None:
+            quant_config.mla_tag = "shared_down_proj"
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -243,10 +247,13 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        if quant_config is not None:
+            quant_config.mla_tag = None
         if not hasattr(self.gate_up_proj, "weight"):
             self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
         if not hasattr(self.down_proj, "weight"):
             self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -1114,6 +1121,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
+            if quant_config is not None:
+                quant_config.mla_tag = "fused_qkv_a_proj_with_mqa"
+                quant_config.mla_q_lora_rank = self.q_lora_rank
             self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
@@ -1121,7 +1131,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
+            if quant_config is not None:
+                quant_config.mla_q_lora_rank = None
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            if quant_config is not None:
+                quant_config.mla_tag = "q_b_proj"
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1131,6 +1145,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
+            if quant_config is not None:
+                quant_config.mla_tag = None
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1425,9 +1441,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 self, positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
-            inner_state = forward_mla_prepare_npu(
-                self, positions, hidden_states, forward_batch, zero_allocator
-            )
+            if hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config") and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name() == "awq":
+                inner_state = self.forward_npu_prepare_bf16(
+                    positions, hidden_states, forward_batch, zero_allocator)
+            else:
+                inner_state = forward_mla_prepare_npu(
+                    self, positions, hidden_states, forward_batch, zero_allocator
+                )                
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
                 self, positions, hidden_states, forward_batch, zero_allocator
@@ -1463,6 +1483,47 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             return forward_dsa_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
+
+    def forward_npu_prepare_bf16(self, positions, hidden_states, forward_batch, zero_allocator):
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+        slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int64)
+
+        (   q_nope_out,
+            q_rope_out,
+            k_cache,
+            v_cache,
+            _,
+            ) = torch_npu.npu_mla_prolog_v2(
+            hidden_states,
+            self.fused_qkv_a_proj_with_mqa.weight1,
+            self.q_b_proj.weight,
+            self.w_kc,
+            self.fused_qkv_a_proj_with_mqa.weight2,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            sin,
+            cos,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            rmsnorm_epsilon_cq = 1e-6,
+            rmsnorm_epsilon_ckv = 1e-6,
+            cache_mode="PA_BSND"
+        )
+        return (
+            q_rope_out,
+            v_cache,
+            q_nope_out,
+            k_cache,
+            forward_batch,
+            zero_allocator,
+            positions,
+            None,
+        )
 
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
