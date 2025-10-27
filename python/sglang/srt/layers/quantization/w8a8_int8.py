@@ -54,8 +54,14 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-logger = logging.getLogger(__name__)
+    try:
+        import custom_ops_qujing
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
 
+logger = logging.getLogger(__name__)
 
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Quantization.

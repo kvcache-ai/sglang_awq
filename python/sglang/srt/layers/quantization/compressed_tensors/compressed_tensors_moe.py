@@ -66,6 +66,10 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    import custom_ops_qujing
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -91,6 +95,7 @@ __all__ = [
     "NPUCompressedTensorsW8A8Int8MoEMethod",
     "CompressedTensorsWNA16MoEMethod",
     "NPUCompressedTensorsW4A16Int4DynamicMoEMethod",
+    "CompressedTensorsWNA16MoEAscendMethod",
 ]
 
 
@@ -117,14 +122,18 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                 return CompressedTensorsWNA16MoEMethod(quant_config)
             else:
-                if (
-                    quant_config._is_dynamic_token_w4(weight_quant, input_quant)
-                    and input_quant is None
-                ):
-                    logger.info_once(
-                        "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
-                    )
-                    return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
+                # if (
+                #     quant_config._is_dynamic_token_w4(weight_quant, input_quant)
+                #     and input_quant is None
+                # ):
+                #     logger.info_once(
+                #         "Using NPUCompressedTensorsW4A16Int4DynamicMoEMethod"
+                #     )
+                #     return NPUCompressedTensorsW4A16Int4DynamicMoEMethod(quant_config)
+                logger.info_once(
+                    "Using CompressedTensorsWNA16MarlinMoEMethod"
+                )
+                return CompressedTensorsWNA16MoEAscendMethod(quant_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoEMethod")
             return CompressedTensorsW4A4Nvfp4MoEMethod(quant_config)
@@ -1114,49 +1123,50 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
-        w13_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_g_idx", w13_g_idx)
-        set_weight_attrs(w13_g_idx, extra_weight_attrs)
+        if not _is_npu:
+            w13_g_idx = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_g_idx", w13_g_idx)
+            set_weight_attrs(w13_g_idx, extra_weight_attrs)
 
-        w2_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_g_idx", w2_g_idx)
-        set_weight_attrs(w2_g_idx, extra_weight_attrs)
+            w2_g_idx = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    intermediate_size_per_partition,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_g_idx", w2_g_idx)
+            set_weight_attrs(w2_g_idx, extra_weight_attrs)
 
-        w13_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
+            w13_g_idx_sort_indices = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+            set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
 
-        w2_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+            w2_g_idx_sort_indices = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    intermediate_size_per_partition,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+            set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
         layer.a13_scale = None
         layer.a2_scale = None
@@ -1764,3 +1774,138 @@ class NPUCompressedTensorsW4A16Int4DynamicMoEMethod(CompressedTensorsMoEMethod):
             group_list,
             output_dtype,
         )
+
+class CompressedTensorsWNA16MoEAscendMethod(CompressedTensorsWNA16MoEMethod):
+    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
+        super().__init__(quant_config, num_gpu_experts)
+        if self.actorder:
+            raise ValueError(
+                "Ascend not support actorder in compressed_tensors for now")
+        if self.num_bits != 4:
+            raise ValueError(
+                "Ascend only support actorder in num_bits = 4 for now")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        ###
+        w13_shape = layer.w13_weight_packed.data.shape
+        w13_qweight_tmp = layer.w13_weight_packed.data.view(torch.uint8).view(-1,1)
+        shifter = torch.tensor([1, 16], dtype=torch.uint8, device=w13_qweight_tmp.device)
+        w13_qweight_tmp = (w13_qweight_tmp // shifter)
+        w13_qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+        w13_qweight_tmp = w13_qweight_tmp.view(-1,w13_shape[2],8).permute(0,2,1).contiguous().view(-1,2)
+        w13_qweight_tmp = w13_qweight_tmp[...,0] + w13_qweight_tmp[...,1] * 16
+        w13_qweight_tmp = w13_qweight_tmp.view(torch.int32).view(w13_shape[0],w13_shape[1]*self.packed_factor,-1)
+
+        ###
+        w2_shape = layer.w2_weight_packed.data.shape
+        w2_qweight_tmp = layer.w2_weight_packed.data.view(torch.uint8).view(-1,1)
+        # shifter = torch.tensor([1, 16], dtype=torch.uint8, device=w2_qweight_tmp.device)
+        w2_qweight_tmp = (w2_qweight_tmp // shifter)
+        w2_qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+        w2_qweight_tmp = w2_qweight_tmp.view(-1,w2_shape[2],8).permute(0,2,1).contiguous().view(-1,2)
+        w2_qweight_tmp = w2_qweight_tmp[...,0] + w2_qweight_tmp[...,1] * 16
+        w2_qweight_tmp = w2_qweight_tmp.view(torch.int32).view(w2_shape[0],w2_shape[1]*self.packed_factor,-1)
+
+        # if useCustomOps:
+        w13_qweight_tmp = w13_qweight_tmp.reshape(w13_qweight_tmp.shape[0],w13_qweight_tmp.shape[1]//16,16,w13_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+        w2_qweight_tmp = w2_qweight_tmp.reshape(w2_qweight_tmp.shape[0],w2_qweight_tmp.shape[1]//16,16,w2_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+        layer.w13_weight_packed.data = layer.w13_weight_packed.data.view(w13_qweight_tmp.shape).copy_(w13_qweight_tmp)
+        layer.w2_weight_packed.data = layer.w2_weight_packed.data.view(w2_qweight_tmp.shape).copy_(w2_qweight_tmp)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    @staticmethod
+    def custom_moe(
+        hidden_states: torch.Tensor,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        group_size = kwargs.get("group_size", 64)
+
+        original_shape = hidden_states.shape
+        if len(original_shape) == 3:
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        if hidden_states.shape[0]==1:
+            final_hidden_states = custom_ops_qujing.npu_moe_ffn(hidden_states,
+                            w13, w13_scale,
+                            w2, w2_scale,
+                            topk_ids.view(-1),
+                            topk_ids.view(-1),
+                            topk_ids.view(-1,top_k),
+                            topk_weights,
+                            group_size,
+                            top_k)
+        else:
+            expanded_expert_idx, sorted_row_idx = torch.sort(topk_ids.view(-1).float())
+            _, expanded_row_idx = torch.sort(sorted_row_idx.float())
+            if torch.npu.current_device() == 0:
+                print(torch.sum((expanded_expert_idx[1:]-expanded_expert_idx[:-1])!=0)+1)
+            final_hidden_states = custom_ops_qujing.npu_moe_ffn(hidden_states,
+                                        w13, w13_scale,
+                                        w2, w2_scale,
+                                        expanded_expert_idx.int(),
+                                        (sorted_row_idx/top_k).int(),
+                                        expanded_row_idx.view(-1,top_k).int(),
+                                        topk_weights,
+                                        group_size,
+                                        top_k)
+        if len(original_shape) == 3:
+            final_hidden_states = final_hidden_states.view(original_shape)
+        return final_hidden_states
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ) -> torch.Tensor:
+        hidden_states = custom_ops_qujing.npu_moe_without_routing_ffn(hidden_states,
+                    layer.w13_weight_packed, layer.w13_weight_scale,
+                    layer.w2_weight_packed, layer.w2_weight_scale,
+                    group_list,
+                    self.group_size)
+        return hidden_states
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, router_logits = topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+
+        output = CompressedTensorsWNA16MoEAscendMethod.custom_moe(
+            hidden_states=x,
+            w13=layer.w13_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2=layer.w2_weight_packed,
+            w2_scale=layer.w2_weight_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+            group_size = self.group_size,
+        )
+        return StandardCombineInput(hidden_states=output)
