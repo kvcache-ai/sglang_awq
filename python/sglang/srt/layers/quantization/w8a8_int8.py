@@ -39,8 +39,14 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
-logger = logging.getLogger(__name__)
+    try:
+        import custom_ops_qujing
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
 
+logger = logging.getLogger(__name__)
 
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Quantization.

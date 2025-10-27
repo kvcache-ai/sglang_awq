@@ -341,24 +341,24 @@ class DeepEPMoE(FusedMoE):
                 device=hidden_states.device,
             )
 
-            if self.w13_weight.dtype == torch.bfloat16:
-                hidden_states = npu_fused_moe_without_routing_weights_bf16(
-                    self, hidden_states, group_list_type, group_list, output_dtype
-                )
-            else:
-                input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
-                if not input_quant and self.w13_weight.dtype != torch.int32:
-                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
-                        hidden_states
-                    )
-                hidden_states = self.quant_method.apply_without_routing_weights(
-                    self,
-                    hidden_states,
-                    hidden_states_scale,
-                    group_list_type,
-                    group_list,
-                    output_dtype,
-                )
+            # if self.w13_weight.dtype == torch.bfloat16:
+            #     hidden_states = npu_fused_moe_without_routing_weights_bf16(
+            #         self, hidden_states, group_list_type, group_list, output_dtype
+            #     )
+            # else:
+            #     input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
+            #     if not input_quant and self.w13_weight.dtype != torch.int32:
+            #         hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
+            #             hidden_states
+            #         )
+            hidden_states = self.quant_method.apply_without_routing_weights(
+                self,
+                hidden_states,
+                hidden_states_scale,
+                group_list_type,
+                group_list,
+                output_dtype,
+            )
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPLLDispatchOutput)
@@ -373,19 +373,19 @@ class DeepEPMoE(FusedMoE):
 
             group_list = group_list.to(torch.int64)
 
-            if self.w13_weight.dtype == torch.bfloat16:
-                hidden_states = npu_fused_moe_without_routing_weights_bf16(
-                    self, hidden_states, group_list_type, group_list, output_dtype
-                )
-            else:
-                hidden_states = self.quant_method.apply_without_routing_weights(
-                    self,
-                    hidden_states,
-                    hidden_states_scale,
-                    group_list_type,
-                    group_list,
-                    output_dtype,
-                )
+            # if self.w13_weight.dtype == torch.bfloat16:
+            #     hidden_states = npu_fused_moe_without_routing_weights_bf16(
+            #         self, hidden_states, group_list_type, group_list, output_dtype
+            #     )
+            # else:
+            hidden_states = self.quant_method.apply_without_routing_weights(
+                self,
+                hidden_states,
+                hidden_states_scale,
+                group_list_type,
+                group_list,
+                output_dtype,
+            )
         else:
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
