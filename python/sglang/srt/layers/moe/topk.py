@@ -371,7 +371,7 @@ class TopK(CustomOp):
             )
 
             return StandardTopKOutput(topk_weights, topk_ids, _)
-        if use_grouped_topk and not torch_native and router_logits.shape[-1] == 256:
+        if use_grouped_topk and not torch_native and router_logits.shape[-1] <= 2048:
             # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
             routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
 
