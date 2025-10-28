@@ -554,9 +554,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
             topk_ids_long = topk_ids.to(torch.int64)
 
-            input_tensor_cpu.copy_(x, non_blocking=True)
-            expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
-            weights_cpu.copy_(topk_weights, non_blocking=True)
+            if torch.npu.is_current_stream_capturing():
+                input_tensor_cpu.copy_(x, non_blocking=True)
+                expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
+                weights_cpu.copy_(topk_weights, non_blocking=True)
+            else:
+                input_tensor_cpu.copy_(x, non_blocking=False)
+                expert_ids_cpu.copy_(topk_ids_long, non_blocking=False)
+                weights_cpu.copy_(topk_weights, non_blocking=False)
 
             self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
             if torch.npu.is_current_stream_capturing():
@@ -638,7 +643,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 export_for_source_row=topk_ids,
             )
         else:
-            final_hidden_states = None
+            final_hidden_states = torch.zeros_like(x)
 
         if self.cpu_method is not None and self.tp_rank == 0:
             if torch.npu.is_current_stream_capturing():
@@ -647,14 +652,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     self._sync_to_cpu,
                     ()
                 )
+                output_gpu = output_cpu.to(device=x.device, non_blocking=True)
             else:
                 self._sync_to_cpu(())
-            output_gpu = output_cpu.to(device=x.device, non_blocking=True)
+                output_gpu = output_cpu.to(device=x.device, non_blocking=False)
             output_cpuinfer = output_gpu.to(dtype=x.dtype)
-            if final_hidden_states is None:
-                final_hidden_states = output_cpuinfer
-            else:
-                final_hidden_states = final_hidden_states + output_cpuinfer
+            final_hidden_states = final_hidden_states + output_cpuinfer
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
