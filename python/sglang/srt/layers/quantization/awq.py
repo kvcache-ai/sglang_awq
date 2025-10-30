@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import os
@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -44,20 +45,16 @@ if TYPE_CHECKING:
         CombineInput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
-    try:
-        import custom_ops
-    except ImportError:
-        useCustomOps = False
-    else:
-        useCustomOps = True
+
 if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
@@ -73,8 +70,12 @@ elif _is_hip:
     )
 
     warnings.warn(f"HIP does not support fused_marlin_moe currently.")
+elif _is_xpu:
+    from sgl_kernel import awq_dequantize
+
+    warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA and HIP support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,16 @@ class AWQConfig(QuantizationConfig):
                     return AWQAMXEPMoEMethod(self, layer_id)
                 else:
                     return AWQMoEAscendMethod(self)
+            return None
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if _is_npu:
+            if isinstance(layer, LinearBase):
+                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                    return UnquantizedLinearMethod()
+                return AWQLinearAscendMethod(self)
+            elif isinstance(layer, FusedMoE):
+                return AWQMoEAscendMethod(self)
             return None
 
         if isinstance(layer, LinearBase):
@@ -997,12 +1008,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
-        # The input must currently be float16
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
         orig_dtype = x.dtype
-        x = x.half()
 
         topk_weights, topk_ids, router_logits = topk_output
 
@@ -1022,90 +1030,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
             num_bits=self.quant_config.weight_bits,
         ).to(orig_dtype)
         return StandardCombineInput(hidden_states=output)
-
-
-def npu_fused_experts(
-    hidden_states: torch.Tensor,
-    w13: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w13_offset: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w2_offset: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int,
-    **kwargs,
-):
-    group_size = kwargs.get("group_size", 64)
-    original_shape = hidden_states.shape
-    original_dtype = hidden_states.dtype
-    scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
-    if len(original_shape) == 3:
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    num_tokens = hidden_states.shape[0]
-    num_experts = w13.shape[0]
-    row_idx_len = num_tokens * top_k
-    row_idx = (
-        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
-    )
-    hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch_npu.npu_moe_init_routing(
-            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-        )
-    )
-    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-        expanded_expert_idx, num_experts
-    )
-    expert_tokens = expert_tokens.to(torch.int64)
-    # gmm1: gate_up_proj
-    if useCustomOps:
-        hidden_states = custom_ops.npu_gmm_custom(hidden_states, w13, w13_scale, w13_offset, group_size, group_list=expert_tokens)
-    else:
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w13],
-            antiquant_scale=[w13_scale],
-            antiquant_offset=[w13_offset],
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
-    # act_fn: swiglu
-    hidden_states = torch_npu.npu_swiglu(hidden_states)
-    # gmm2: down_proj
-    if useCustomOps:
-        hidden_states = custom_ops.npu_gmm_custom(hidden_states, w2, w2_scale, w2_offset, group_size, group_list=expert_tokens)
-    else:
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w2],
-            antiquant_scale=[w2_scale],
-            antiquant_offset=[w2_offset],
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-        )[0]
-
-    final_hidden_states = torch_npu.npu_moe_finalize_routing(
-        hidden_states,
-        skip1=None,
-        skip2=None,
-        bias=None,
-        scales=topk_weights,
-        expanded_src_to_dst_row=expanded_row_idx,
-        export_for_source_row=topk_ids,
-    )
-    if len(original_shape) == 3:
-        final_hidden_states = final_hidden_states.view(original_shape)
-    return final_hidden_states
 
 
 class AWQMoEAscendMethod(AWQMoEMethod):
@@ -1137,26 +1061,17 @@ class AWQMoEAscendMethod(AWQMoEMethod):
 
         w13_qweight_tmp.bitwise_xor_(0x88888888)
         w2_qweight_tmp.bitwise_xor_(0x88888888)
-        if useCustomOps:
-            w13_qweight_tmp = w13_qweight_tmp.reshape(w13_qweight_tmp.shape[0],w13_qweight_tmp.shape[1]//16,16,w13_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
-            w2_qweight_tmp = w2_qweight_tmp.reshape(w2_qweight_tmp.shape[0],w2_qweight_tmp.shape[1]//16,16,w2_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
 
         w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
             layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
         w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-
+        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
         w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
             layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
         w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-
-        if useCustomOps:
-            w13_qzeros_tmp = w13_qzeros_tmp.to(torch.float16)
-            w2_qzeros_tmp = w2_qzeros_tmp.to(torch.float16)
-        else:
-            w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-            w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
 
         layer.register_parameter(
             "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
@@ -1182,7 +1097,7 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        
+
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
@@ -1204,6 +1119,6 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
-            group_size=self.quant_config.group_size
+            use_wna16=True,
         )
         return StandardCombineInput(hidden_states=output)
