@@ -91,29 +91,15 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
-        if num_new_pages_item < 200:
-            import sgl_kernel_npu  # noqa: F401
-
-            torch.ops.npu.alloc_extend(
-                prefix_lens,
-                seq_lens,
-                last_loc,
-                self.free_pages,
-                self.page_size,
-                out_indices,
-                num_new_pages,
-            )
-
-        else:
-            alloc_extend_kernel_ascend(
-                prefix_lens,
-                seq_lens,
-                last_loc,
-                self.free_pages,
-                out_indices,
-                self.page_size,
-                self.device,
-            )
+        alloc_extend_kernel_ascend(
+            prefix_lens,
+            seq_lens,
+            last_loc,
+            self.free_pages,
+            out_indices,
+            self.page_size,
+            self.device,
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
