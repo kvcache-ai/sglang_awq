@@ -378,6 +378,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
+            model_config=config,
             num_experts=config.n_routed_experts,
             top_k=self.top_k,
             layer_id=self.layer_id,

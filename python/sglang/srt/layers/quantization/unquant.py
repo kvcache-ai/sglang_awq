@@ -367,15 +367,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def sync(
         self, x
     ) -> torch.Tensor :
-        if self.tp_rank == 0:
-            _, _, _, output_cpu, _ = KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
+        _, _, _, output_cpu, _ = KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
+        if torch.npu.is_current_stream_capturing():
             torch_npu.npu._launch_host_func(
                 torch.npu.current_stream(),
                 self._sync_to_cpu,
                 ()
             )
             output_gpu = output_cpu.to(device=x.device, non_blocking=True)
-            output = output_gpu.to(dtype=x.dtype)
+        else:
+            self._sync_to_cpu(())
+            output_gpu = output_cpu.to(device=x.device, non_blocking=False)
+        output = output_gpu.to(dtype=x.dtype)
         return output
 
     def submit(
@@ -395,17 +398,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
             topk_ids_long = topk_ids.to(torch.int64)
 
-            input_tensor_cpu.copy_(x, non_blocking=True)
-            expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
-            weights_cpu.copy_(topk_weights, non_blocking=True)
+            if torch.npu.is_current_stream_capturing():
+                input_tensor_cpu.copy_(x, non_blocking=True)
+                expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
+                weights_cpu.copy_(topk_weights, non_blocking=True)
+            else:
+                input_tensor_cpu.copy_(x, non_blocking=False)
+                expert_ids_cpu.copy_(topk_ids_long, non_blocking=False)
+                weights_cpu.copy_(topk_weights, non_blocking=False)
 
             self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
-            
-            torch_npu.npu._launch_host_func(
-                torch.npu.current_stream(),
-                self._submit_to_cpu,
-                self.moe_kexperts_param
-            )
+            if torch.npu.is_current_stream_capturing():
+                torch_npu.npu._launch_host_func(
+                    torch.npu.current_stream(),
+                    self._submit_to_cpu,
+                    self.moe_kexperts_param
+                )
+            else:
+                self._submit_to_cpu(self.moe_kexperts_param)
+
         return StandardCombineInput(hidden_states=torch.zeros_like(x))
 
     def forward_cuda(
