@@ -144,6 +144,8 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -546,6 +548,7 @@ class MoEGate(nn.Module):
 
         return logits
 
+share=torch.npu.Stream()
 
 class DeepseekV2MoE(nn.Module):
 
@@ -571,7 +574,6 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
-
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -784,13 +786,15 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
 
         if hidden_states.shape[0] > 0:
-            if not self._fuse_shared_experts_inside_sbo:
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
-                )
-            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
+
+            if not self._fuse_shared_experts_inside_sbo:
+                share.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(share):
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, gemm_output_zero_allocator
+                    )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -816,6 +820,7 @@ class DeepseekV2MoE(nn.Module):
                 else {}
             ),
         )
+        torch_npu.npu.current_stream().wait_stream(share)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
