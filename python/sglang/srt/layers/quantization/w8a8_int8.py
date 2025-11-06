@@ -1243,13 +1243,6 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
 
         self.moe = KMLInt4_MOE(awq_moe_config)
 
-        # from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
-        # physical_to_logical_map_cpu = get_global_expert_location_metadata().physical_to_logical_map_cpu[self.layer_idx].contiguous()
-        # print(physical_to_logical_map_cpu, flush=True)
-        # self.cpu_infer.submit(
-        #     self.moe.load_weights(physical_to_logical_map_cpu.data_ptr())
-        # )
-
         self.cpu_infer.submit(
             self.moe.load_weights_task()
         )
@@ -1357,24 +1350,23 @@ class NPU_W8A8CPUEPMoEMethod(FusedMoEMethodBase):
             input_tensor_cpu, expert_ids_cpu, weights_cpu, output_cpu, bsz_tensor_cpu = \
                 KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
             topk_ids_long = topk_ids.to(torch.int64)
+            self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
 
             if torch.npu.is_current_stream_capturing():
                 input_tensor_cpu.copy_(x, non_blocking=True)
                 expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
                 weights_cpu.copy_(topk_weights, non_blocking=True)
-            else:
-                input_tensor_cpu.copy_(x, non_blocking=False)
-                expert_ids_cpu.copy_(topk_ids_long, non_blocking=False)
-                weights_cpu.copy_(topk_weights, non_blocking=False)
 
-            self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
-            if torch.npu.is_current_stream_capturing():
                 torch_npu.npu._launch_host_func(
                     torch.npu.current_stream(),
                     self._submit_to_cpu,
                     self.moe_kexperts_param
                 )
             else:
+                input_tensor_cpu.copy_(x, non_blocking=False)
+                expert_ids_cpu.copy_(topk_ids_long, non_blocking=False)
+                weights_cpu.copy_(topk_weights, non_blocking=False)
+
                 self._submit_to_cpu(self.moe_kexperts_param)
 
         return StandardCombineInput(hidden_states=torch.zeros_like(x))
@@ -1407,45 +1399,41 @@ class NPU_W8A8CPUEPMoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
-
+        output = torch.zeros_like(x)
+        
         if self.tp_rank == 0:
             input_tensor_cpu, expert_ids_cpu, weights_cpu, output_cpu, bsz_tensor_cpu = \
                 KExpertsCPUBuffer.get_buffer(x, self.cpu_method.num_experts_per_tok)
             topk_ids_long = topk_ids.to(torch.int64)
 
+            self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
+
             if torch.npu.is_current_stream_capturing():
                 input_tensor_cpu.copy_(x, non_blocking=True)
                 expert_ids_cpu.copy_(topk_ids_long, non_blocking=True)
                 weights_cpu.copy_(topk_weights, non_blocking=True)
-            else:
-                input_tensor_cpu.copy_(x, non_blocking=False)
-                expert_ids_cpu.copy_(topk_ids_long, non_blocking=False)
-                weights_cpu.copy_(topk_weights, non_blocking=False)
 
-            self.moe_kexperts_param = (bsz_tensor_cpu, expert_ids_cpu, weights_cpu, input_tensor_cpu, output_cpu)
-            if torch.npu.is_current_stream_capturing():
                 torch_npu.npu._launch_host_func(
                     torch.npu.current_stream(),
                     self._submit_to_cpu,
                     self.moe_kexperts_param
                 )
-            else:
-                self._submit_to_cpu(self.moe_kexperts_param)
-        
-        output = torch.zeros_like(x)
-
-        # Wait for CPU and combine results
-        if self.tp_rank == 0:
-            if torch.npu.is_current_stream_capturing():
                 torch_npu.npu._launch_host_func(
                     torch.npu.current_stream(),
                     self._sync_to_cpu,
                     ()
                 )
                 output_gpu = output_cpu.to(device=x.device, non_blocking=True)
+
             else:
+                input_tensor_cpu.copy_(x, non_blocking=False)
+                expert_ids_cpu.copy_(topk_ids_long, non_blocking=False)
+                weights_cpu.copy_(topk_weights, non_blocking=False)
+
+                self._submit_to_cpu(self.moe_kexperts_param)
                 self._sync_to_cpu(())
                 output_gpu = output_cpu.to(device=x.device, non_blocking=False)
+                
             output = output + output_gpu.to(dtype=x.dtype)
 
         return StandardCombineInput(hidden_states=output)
