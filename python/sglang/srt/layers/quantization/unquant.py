@@ -32,17 +32,15 @@ _is_npu = is_npu()
 if _is_npu:
     import torch_npu
 try:
-    import cpuinfer_ext
+    import kt_kernel_ext
     from sglang.srt.distributed import get_tensor_model_parallel_rank
     CPUINFER_AVAILABLE = True
-    if CPUINFER_AVAILABLE and cpuinfer_ext:
-        # from cpuinfer_ext import QuantConfig
-        from cpuinfer_ext.kvcache import ggml_type
-        from cpuinfer_ext.moe import MOEConfig, KMLInt4_MOE, KMLInt8_MOE
+    if CPUINFER_AVAILABLE and kt_kernel_ext:
+        from kt_kernel_ext.moe import MOEConfig, Int4_KERNEL_MOE
 except ImportError as e:
     print(f"[WARN]: CPUInfer is not available {e.msg}")
     CPUINFER_AVAILABLE = False
-    cpuinfer_ext = None
+    kt_kernel = None
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -659,7 +657,7 @@ class CPUMoEMethod():
             return
         if CPUMoEMethod.CPU_INFER is None:
             print(f"subpool count is {subpool_count}", flush=True)
-            worker_config = cpuinfer_ext.WorkerPoolConfig()
+            worker_config = kt_kernel_ext.WorkerPoolConfig()
             subpool_numa_map = list(range(subpool_count))
             subpool_thread_count = [
             cpuinfer // subpool_count + (1 if i < cpuinfer % subpool_count else 0)
@@ -669,7 +667,7 @@ class CPUMoEMethod():
             worker_config.subpool_count = subpool_count
             worker_config.subpool_numa_map= subpool_numa_map
             worker_config.subpool_thread_count = subpool_thread_count
-            CPUMoEMethod.CPU_INFER = cpuinfer_ext.CPUInfer(worker_config)
+            CPUMoEMethod.CPU_INFER = kt_kernel_ext.CPUInfer(worker_config)
         self.cpu_infer = CPUMoEMethod.CPU_INFER
         # read safetensor weight
         self.load_merged_weight = False
@@ -761,10 +759,7 @@ class CPUMoEMethod():
             moe_config.load = True
             moe_config.path = self.cpu_weight_path
 
-        moe_config.hidden_type = ggml_type.BF16
-        moe_config.output_type = ggml_type.FP32
-
-        self.moe = KMLInt4_MOE(moe_config)
+        self.moe = Int4_KERNEL_MOE(moe_config)
 
         self.cpu_infer.submit(
             self.moe.load_weights_task()
