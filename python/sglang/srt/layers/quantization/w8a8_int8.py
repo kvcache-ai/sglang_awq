@@ -1190,17 +1190,15 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
         torch.npu.synchronize()
 
         # Initialize W8A* MoE for CPU inference
-        awq_moe_config = MOEConfig(
+        moe_config = MOEConfig(
             self.experts_num,
             self.num_experts_per_tok,
             self.hidden_size,
             self.moe_intermediate_size
         )
-        awq_moe_config.layer_idx = self.layer_idx
-        awq_moe_config.pool = self.cpu_infer.backend_
-        awq_moe_config.max_len = self.chunked_prefill_size
-
-        #TODO(Yue Chen) load from SafeTensor is not support
+        moe_config.layer_idx = self.layer_idx
+        moe_config.pool = self.cpu_infer.backend_
+        moe_config.max_len = self.chunked_prefill_size
 
         if self.load_merged_weight:
             gate_proj_ptr = 0
@@ -1219,28 +1217,28 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
                 up_proj_ptr = self.up_proj.data_ptr()
                 down_proj_ptr = self.down_proj.data_ptr()
 
-            awq_moe_config.gate_proj = gate_proj_ptr
-            awq_moe_config.up_proj = up_proj_ptr
-            awq_moe_config.down_proj = down_proj_ptr
+            moe_config.gate_proj = gate_proj_ptr
+            moe_config.up_proj = up_proj_ptr
+            moe_config.down_proj = down_proj_ptr
 
             if self.cpu_save:
-                awq_moe_config.save = True
-                awq_moe_config.load = False
+                moe_config.save = True
+                moe_config.load = False
             else:
-                awq_moe_config.load = True
-            awq_moe_config.path = self.cpu_weight_path
+                moe_config.load = True
+            moe_config.path = self.cpu_weight_path
         else:
-            awq_moe_config.load = True
-            awq_moe_config.path = self.cpu_weight_path
+            moe_config.load = True
+            moe_config.path = self.cpu_weight_path
 
-        self.moe = Int4_KERNEL_MOE(awq_moe_config)
+        self.moe = Int4_KERNEL_MOE(moe_config)
 
         self.cpu_infer.submit(
             self.moe.load_weights_task()
         )
         self.cpu_infer.sync()
 
-        del awq_moe_config
+        del moe_config
 
         if self.load_merged_weight:
             del self.gate_proj

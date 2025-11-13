@@ -772,7 +772,7 @@ class CPUMoEMethod():
 
             del w
 
-        logger.info(f"Loading W8A8 weights from {self.cpu_weight_path} for layer {self.layer_idx}")
+        logger.info(f"Loading INT4 weights from {self.cpu_weight_path} for layer {self.layer_idx}")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

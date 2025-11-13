@@ -221,7 +221,10 @@ class FusedMoE(torch.nn.Module):
             if quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
-                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels, self.layer_id)
+
+        if not hasattr(model_config, 'first_k_dense_replace'):
+            model_config.first_k_dense_replace = 0
         self.defer_layers = list(range(model_config.first_k_dense_replace, model_config.num_hidden_layers-1))
 
         self.quant_method.create_weights(
@@ -235,6 +238,8 @@ class FusedMoE(torch.nn.Module):
                 if not use_weight_loader_fused
                 else self.weight_loader_fused
             ),
+            intermediate_size_full=intermediate_size,
+            top_k=top_k,
             with_bias=with_bias,
         )
 
