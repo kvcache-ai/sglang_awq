@@ -5,8 +5,8 @@ from __future__ import annotations
 import enum
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING
-
+from typing import TYPE_CHECKING,Union,Literal
+import torch.nn.functional as F
 try:
     from sgl_kernel import fused_marlin_moe
 
@@ -33,7 +33,8 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, set_weight_attrs
+from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-
+_is_npu = is_npu()
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
@@ -66,6 +67,116 @@ def _mask_topk_ids_cpu_experts(topk_ids: torch.Tensor, num_gpu_experts: int):
     """Mask topk_ids >= num_gpu_experts by setting them to -1."""
     topk_ids[topk_ids >= num_gpu_experts] = -1
 
+def unpack_from_int32(
+    value: torch.Tensor,
+    num_bits: int,
+    packed_dim: Union[Literal[0], Literal[1]] = 0,
+) -> torch.Tensor:
+    """
+    Unpacks a tensor of packed int32 weights into individual int8s, maintaining the
+    original bit range.
+
+    Return tensors in int8
+
+    :param value: tensor to upack
+    :param num_bits: number of bits to unpack each data point into
+    :param shape: shape to unpack into, used to remove padding
+    :returns: unpacked int8 tensor
+    """
+    if value.dtype is not torch.int32:
+        raise ValueError(
+            f"Expected {torch.int32} but got {value.dtype}, Aborting unpack."
+        )
+
+    if num_bits > 8:
+        raise ValueError("Unpacking is only supported for less than 8 bits")
+
+    pack_factor = 32 // num_bits
+
+    # unpack
+    mask = (1 << num_bits) - 1
+
+    if packed_dim == 1:
+        unpacked = torch.zeros(
+            (value.shape[0], value.shape[1], value.shape[2] * pack_factor),
+            device=value.device,
+            dtype=torch.int32,
+        )
+        for j in range(value.shape[0]):
+            for i in range(pack_factor):
+                unpacked[j,:, i::pack_factor] = (value[j] >> (num_bits * i)) & mask
+
+    else:
+        unpacked = torch.zeros(
+            (value.shape[0], value.shape[1] * pack_factor, value.shape[2]),
+            device=value.device,
+            dtype=torch.int32,
+        )
+        for j in range(value.shape[0]):
+            for i in range(pack_factor):
+                unpacked[j,i::pack_factor, :] = (value[j] >> (num_bits * i)) & mask
+
+    # bits are packed in unsigned format, reformat to signed
+    # update the value range from unsigned to signed
+    offset = pow(2, num_bits) // 2
+    unpacked = (unpacked - offset).to(torch.int8)
+
+    return unpacked
+
+def pack_int4_rows_to_int32(x: torch.Tensor) -> torch.Tensor:
+    B, M, N = x.shape
+    pack_factor = 8
+    bits = 4
+
+    # 1. 补齐 N 到 8 的倍数（在最后一维右侧补零）
+    N_padded = (N + pack_factor - 1) // pack_factor * pack_factor
+    if N_padded != N:
+        pad = N_padded - N
+        x = F.pad(x, (0, pad))   # (last_dim_right, last_dim_left, ...)
+
+    # 2. reshape 成每 8 个一组：[B, M, G, 8]
+    G = N_padded // pack_factor
+    x_group = x.view(B, M, G, pack_factor)    # 仍然是 int8
+
+    # 3. 分配输出：只占 N/8，大大缩小体积
+    packed = torch.zeros(B, M, G, dtype=torch.int32, device=x.device)
+
+    # 4. 逐个 nibble 打包进 int32
+    for i in range(pack_factor):
+        # 取出第 i 个 nibble，形状 [B, M, G]，还是 int8
+        # 只保留低 4bit，然后临时转成 int32
+        nibble_i = (x_group[..., i] & 0xF).to(torch.int32)
+        # 左移到对应 bit 段，然后 OR 到 packed 里
+        packed |= nibble_i << (i * bits)
+
+    return packed
+
+
+def pack_to_int32(
+    value: torch.Tensor,
+    num_bits: int,
+) -> torch.Tensor:
+    
+    mask = (1 << num_bits) - 1     # e.g., 4bit -> 0xF
+    B = value.shape[0]
+    pack_factor = 32 // num_bits
+    results = []
+
+    for b in range(B):
+        x = value[b]          # [R, C]
+        R, C = x.shape
+
+        num_groups = C // pack_factor
+        x = x.view(R, num_groups, pack_factor)
+        x = (x & mask).to(torch.int32)
+
+        # 打包
+        bit_shifts = torch.arange(pack_factor, device=value.device, dtype=torch.int32) * num_bits
+        packed = (x << bit_shifts).sum(dim=2, dtype=torch.int32)
+
+        results.append(packed.unsqueeze(0))
+
+    return torch.cat(results, dim=0)
 
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
@@ -580,40 +691,49 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             )
+        if _is_npu:
+            w13_weight_tmp=unpack_from_int32(layer.w13_weight_packed,4)
+            w2_weight_tmp=unpack_from_int32(layer.w2_weight_packed,4)
+            w13_weight_tmp=pack_to_int32(w13_weight_tmp,4)
+            w2_weight_tmp =pack_to_int32(w2_weight_tmp,4)
+            # w13_weight_tmp=pack_int4_rows_to_int32(w13_weight_tmp)
+            # w2_weight_tmp =pack_int4_rows_to_int32(w2_weight_tmp)
+            replace_parameter(layer, "w13_weight_packed", w13_weight_tmp)
+            replace_parameter(layer, "w2_weight_packed", w2_weight_tmp)
+        else:
+            marlin_w13_qweight = gptq_marlin_moe_repack(
+                layer.w13_weight_packed,
+                layer.w13_g_idx_sort_indices,
+                layer.w13_weight_packed.shape[1] * self.packed_factor,
+                layer.w13_weight_packed.shape[2],
+                self.num_bits,
+            )
+            replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+            marlin_w2_qweight = gptq_marlin_moe_repack(
+                layer.w2_weight_packed,
+                layer.w2_g_idx_sort_indices,
+                layer.w2_weight_packed.shape[1] * self.packed_factor,
+                layer.w2_weight_packed.shape[2],
+                self.num_bits,
+            )
+            replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
+            # Repack scales
+            marlin_w13_scales = marlin_moe_permute_scales(
+                layer.w13_weight_scale,
+                layer.w13_weight_packed.shape[2],
+                layer.w13_weight_scale.shape[2],
+                self.group_size,
+            )
+            replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
 
-        marlin_w13_qweight = gptq_marlin_moe_repack(
-            layer.w13_weight_packed,
-            layer.w13_g_idx_sort_indices,
-            layer.w13_weight_packed.shape[1] * self.packed_factor,
-            layer.w13_weight_packed.shape[2],
-            self.num_bits,
-        )
-        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
-        marlin_w2_qweight = gptq_marlin_moe_repack(
-            layer.w2_weight_packed,
-            layer.w2_g_idx_sort_indices,
-            layer.w2_weight_packed.shape[1] * self.packed_factor,
-            layer.w2_weight_packed.shape[2],
-            self.num_bits,
-        )
-        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
-        # Repack scales
-        marlin_w13_scales = marlin_moe_permute_scales(
-            layer.w13_weight_scale,
-            layer.w13_weight_packed.shape[2],
-            layer.w13_weight_scale.shape[2],
-            self.group_size,
-        )
-        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
-
-        marlin_w2_scales = marlin_moe_permute_scales(
-            layer.w2_weight_scale,
-            layer.w2_weight_scale.shape[1]
-            * (self.group_size if self.group_size != -1 else self.packed_factor),
-            layer.w2_weight_scale.shape[2],
-            self.group_size,
-        )
-        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+            marlin_w2_scales = marlin_moe_permute_scales(
+                layer.w2_weight_scale,
+                layer.w2_weight_scale.shape[1]
+                * (self.group_size if self.group_size != -1 else self.packed_factor),
+                layer.w2_weight_scale.shape[2],
+                self.group_size,
+            )
+            replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -636,23 +756,37 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, router_logits = topk_output
-
-        output = fused_marlin_moe(
-            x,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            g_idx1=layer.w13_weight_g_idx,
-            g_idx2=layer.w2_weight_g_idx,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
-            num_bits=self.num_bits,
-            is_k_full=self.is_k_full,
-            expert_map=torch.empty(1, device=x.device),
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
-        )
+        if _is_npu:
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = topk_weights.to(x.dtype)
+            output = npu_fused_experts(
+                hidden_states=x,
+                w13=layer.w13_weight_packed,
+                w13_scale=layer.w13_weight_scale,
+                w2=layer.w2_weight_packed,
+                w2_scale=layer.w2_weight_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
+                use_wna16=True,
+            )
+        else:
+            output = fused_marlin_moe(
+                x,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                g_idx1=layer.w13_weight_g_idx,
+                g_idx2=layer.w2_weight_g_idx,
+                sort_indices1=layer.w13_g_idx_sort_indices,
+                sort_indices2=layer.w2_g_idx_sort_indices,
+                num_bits=self.num_bits,
+                is_k_full=self.is_k_full,
+                expert_map=torch.empty(1, device=x.device),
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            )
         return StandardCombineInput(hidden_states=output)

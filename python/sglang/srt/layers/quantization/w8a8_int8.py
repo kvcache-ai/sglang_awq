@@ -162,6 +162,8 @@ def npu_fused_experts(
             "per_token_scale": [pertoken_scale],
         }
     else:
+        if w13_offset is None:
+            w13_offset = torch.zeros_like(w13_scale, dtype=w13_scale.dtype, device=w13_scale.device)
         scale_args13 = {
             "antiquant_scale": [w13_scale],
             "antiquant_offset": [w13_offset],
@@ -187,6 +189,8 @@ def npu_fused_experts(
             "per_token_scale": [pertoken_scale],
         }
     else:
+        if w2_offset is None:
+            w2_offset = torch.zeros_like(w2_scale, dtype=w2_scale.dtype, device=w2_scale.device)
         scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
     # gmm2: down_proj
     hidden_states = torch_npu.npu_grouped_matmul(
