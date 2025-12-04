@@ -121,18 +121,54 @@ class SafeTensorLoader():
         self.file_handle_map.clear()
 
     def load_experts(self, base_key: str, device: str="cpu"):
-        """Load experts with automatic format detection (NUMA vs raw W8A8)"""
-        # Try NUMA format first (backward compatibility)
-        amx_up_base = f"{base_key}.ffn_up_exps" 
-        if self.has_tensor(f"{amx_up_base}.0.weight"):
-            return self._load_experts_amx_format(base_key, device)
+        up_base_key = f"{base_key}.ffn_up_exps"
+        gate_base_key = f"{base_key}.ffn_gate_exps"
+        down_base_key = f"{base_key}.ffn_down_exps"
+        max_numa_id = -1
+        max_experts_count = -1
+        while self.has_tensor(f"{up_base_key}.{max_experts_count+1}.numa.{0}.weight"):
+            max_experts_count += 1
+        if max_experts_count == 0:
+            raise ValueError(f"No experts found for key {base_key}")
+        while self.has_tensor(f"{up_base_key}.{0}.numa.{max_numa_id+1}.weight"):
+            max_numa_id += 1
+        # Initialize empty lists to store tensors for each projection type
+        up_weights = [[] for _ in range(max_numa_id + 1)]
+        gate_weights = [[] for _ in range(max_numa_id + 1)]
+        down_weights = [[] for _ in range(max_numa_id + 1)]
+        up_scales = [[] for _ in range(max_numa_id + 1)]
+        gate_scales = [[] for _ in range(max_numa_id + 1)]
+        down_scales = [[] for _ in range(max_numa_id + 1)]
+        for numa_id in range(max_numa_id + 1):
+            for expert_id in range(max_experts_count + 1):
+                up_key = f"{up_base_key}.{expert_id}.numa.{numa_id}.weight"
+                gate_key = f"{gate_base_key}.{expert_id}.numa.{numa_id}.weight"
+                down_key = f"{down_base_key}.{expert_id}.numa.{numa_id}.weight"
+                up_scale_key = f"{up_base_key}.{expert_id}.numa.{numa_id}.scale"
+                gate_scale_key = f"{gate_base_key}.{expert_id}.numa.{numa_id}.scale"
+                down_scale_key = f"{down_base_key}.{expert_id}.numa.{numa_id}.scale"
+                # make sure contiguous
+                up_tensor = self.load_tensor(up_key, device).numpy()
+                gate_tensor = self.load_tensor(gate_key, device).numpy()
+                down_tensor = self.load_tensor(down_key, device).numpy()
+                up_scale_tensor = self.load_tensor(up_scale_key, device).numpy()
+                gate_scale_tensor = self.load_tensor(gate_scale_key, device).numpy()
+                down_scale_tensor = self.load_tensor(down_scale_key, device).numpy()
 
-        original_up_base = f"{base_key}.mlp.experts.0.up_proj.weight"
-        if self.has_tensor(f"{original_up_base}"):
-            return self._load_experts_original_format(base_key, device)
-            
-        raise ValueError(f"No experts found for key {base_key} in either format")
-
+                up_weights[numa_id].append(up_tensor)
+                gate_weights[numa_id].append(gate_tensor)
+                down_weights[numa_id].append(down_tensor)
+                up_scales[numa_id].append(up_scale_tensor)
+                gate_scales[numa_id].append(gate_scale_tensor)
+                down_scales[numa_id].append(down_scale_tensor)
+        return {
+            "up": up_weights,
+            "gate": gate_weights,
+            "down": down_weights,
+            "up_scale": up_scales,
+            "gate_scale": gate_scales,
+            "down_scale": down_scales,
+        }
     def _load_experts_original_format(self, base_key: str, device: str="cpu"):
         """Load experts in pre-generated AMX-Compatible format (original)"""
         expert_base = f"{base_key}.mlp.experts"

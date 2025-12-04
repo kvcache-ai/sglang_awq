@@ -16,6 +16,7 @@ from typing import (
 import os,glob,logging
 import torch
 from torch.nn.parameter import Parameter
+import ctypes
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
@@ -52,6 +53,7 @@ try:
     CPUINFER_AVAILABLE = True
     if CPUINFER_AVAILABLE and kt_kernel:
         from kt_kernel_ext.moe import MOEConfig, Int4_KERNEL_MOE
+        from kt_kernel_ext.kvcache import ggml_type
 except ImportError as e:
     print(f"[WARN]: CPUInfer is not available {e.msg}")
     CPUINFER_AVAILABLE = False
@@ -1204,36 +1206,96 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
 
+        gate_ptr = 0
+        up_ptr = 0
+        down_ptr = 0
+
+        gate_ptrs = []
+        up_ptrs = []
+        down_ptrs = []
+
+        gate_scale_ptrs = []
+        up_scale_ptrs = []
+        down_scale_ptrs = []
+
         if self.load_merged_weight:
-            gate_proj_ptr = 0
-            up_proj_ptr = 0
-            down_proj_ptr = 0
 
-            if self.load_merged_weight:
-                base_key = f"model.layers.{self.layer_idx}"
-                w = self.safetensor_loader.load_experts(base_key)
+            base_key = f"blk.{self.layer_idx}"
+            w = self.safetensor_loader.load_experts(base_key)
 
-                self.gate_proj = torch.cat(w["gate_weight"], dim=0).contiguous()
-                self.up_proj   = torch.cat(w["up_weight"], dim=0).contiguous()
-                self.down_proj = torch.cat(w["down_weight"], dim=0).contiguous()
-                
-                gate_proj_ptr = self.gate_proj.data_ptr()
-                up_proj_ptr = self.up_proj.data_ptr()
-                down_proj_ptr = self.down_proj.data_ptr()
+            self.gate_weights = w["gate"]
+            self.up_weights = w["up"]
+            self.down_weights = w["down"]
+            self.gate_scales = w["gate_scale"]
+            self.up_scales = w["up_scale"]
+            self.down_scales = w["down_scale"]
 
-            moe_config.gate_proj = gate_proj_ptr
-            moe_config.up_proj = up_proj_ptr
-            moe_config.down_proj = down_proj_ptr
+            gate_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.gate_weights
+            ]
 
-            if self.cpu_save:
-                moe_config.save = True
-                moe_config.load = False
-            else:
-                moe_config.load = True
-            moe_config.path = self.cpu_weight_path
-        else:
-            moe_config.load = True
-            moe_config.path = self.cpu_weight_path
+            up_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.up_weights
+            ]
+
+            down_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.down_weights
+            ]
+
+            gate_scale_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.gate_scales
+            ]
+
+            up_scale_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.up_scales
+            ]
+
+            down_scale_ptrs = [
+                [
+                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
+                    for et in numa_array
+                ]
+                for numa_array in self.down_scales
+            ]
+
+        moe_config.load = True
+        moe_config.path = self.cpu_weight_path
+
+        moe_config.gate_proj = gate_ptr
+        moe_config.up_proj = up_ptr
+        moe_config.down_proj = down_ptr
+        moe_config.gate_projs = gate_ptrs
+        moe_config.up_projs = up_ptrs
+        moe_config.down_projs = down_ptrs
+        moe_config.gate_scales = gate_scale_ptrs
+        moe_config.up_scales = up_scale_ptrs
+        moe_config.down_scales = down_scale_ptrs
+
+        moe_config.save = False
+        moe_config.load = False
+
+        moe_config.hidden_type = ggml_type.BF16
+        moe_config.output_type = ggml_type.FP32
 
         self.moe = Int4_KERNEL_MOE(moe_config)
 
@@ -1245,9 +1307,12 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
         del moe_config
 
         if self.load_merged_weight:
-            del self.gate_proj
-            del self.up_proj
-            del self.down_proj
+            del self.gate_weights
+            del self.up_weights
+            del self.down_weights
+            del self.gate_scales
+            del self.up_scales
+            del self.down_scales
 
             del w
 
