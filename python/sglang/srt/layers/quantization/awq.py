@@ -8,9 +8,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 import os
 import re
-import glob
-import ctypes
-import numpy as np
 from safetensors import safe_open
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
@@ -54,6 +51,12 @@ _is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
+    try:
+        import custom_ops_qujing
+    except ImportError:
+        useCustomOps = False
+    else:
+        useCustomOps = True
 
 if _is_cuda:
     from sgl_kernel import (
@@ -86,154 +89,7 @@ ScalarType, scalar_types = get_scalar_types()
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
-class SafeTensorLoader():
-    tensor_file_map: dict
-    tensor_type_map: dict
-    file_handle_map: dict
-    tensor_device_map: dict
 
-    def __init__(self, file_path: str):
-        self.__load_tensor_file_map(file_path)
-
-    def __load_tensor_file_map(self, file_path: str):
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Path not found: {file_path}")
-        if os.path.isfile(file_path):
-            folder_path = os.path.dirname(file_path)
-        else:
-            folder_path = file_path
-        self.file_handle_map = {}
-        self.tensor_file_map = {}
-        self.tensor_type_map = {}
-        self.tensor_device_map = {}
-
-        found_safetensor = False
-        for root, _, files in os.walk(folder_path):
-            files = sorted(files)
-            for file in files:
-                if file.endswith(".safetensors"):
-                    found_safetensor = True
-                    file_path = os.path.join(root, file)
-                    if file not in self.file_handle_map:
-                        try:
-                            handle = safe_open(file_path, framework="pt")
-                            self.file_handle_map[file] = handle
-                        except Exception as e:
-                            print(f"Error opening Safetensor file {file_path}: {e}")
-                            continue
-
-                    f = self.file_handle_map.get(file)
-                    if f is None:
-                        continue
-                    try:
-                        for key in f.keys():
-                            self.tensor_file_map[key] = file
-                    except Exception as e:
-                        print(f"Error reading Safetensor file {file_path}: {e}")
-
-        if not found_safetensor:
-            raise FileNotFoundError(f"No Safetensor files found in {folder_path}")
-
-    def load_tensor(self, key: str, device: str="cpu"):
-        if key not in self.tensor_file_map:
-            raise KeyError(f"Key {key} not found in Safetensor files")
-        file = self.tensor_file_map[key]
-        f = self.file_handle_map.get(file)
-        if f is None:
-            raise FileNotFoundError(f"File {file} not found in Safetensor files")
-        tensor = f.get_tensor(key)
-        return tensor.to(device)
-
-    def close_all_handles(self):
-        # for handle in self.file_handle_map.values():
-        #     handle.close()
-        self.file_handle_map.clear()
-
-    def load_experts(self, base_key: str, device: str="cpu"):
-        """Load experts with automatic format detection (NUMA vs raw AWQ)"""
-        # Try NUMA format first (backward compatibility)
-        amx_up_base = f"{base_key}.ffn_up_exps" 
-        if self.has_tensor(f"{amx_up_base}.0.weight"):
-            return self._load_experts_amx_format(base_key, device)
-            
-        raise ValueError(f"No experts found for key {base_key} in either format")
-    
-    def _load_experts_amx_format(self, base_key: str, device: str="cpu"):
-        """Load experts in pre-generated AMX-Compatible format (original)"""
-        up_base_key = f"{base_key}.ffn_up_exps"
-        gate_base_key = f"{base_key}.ffn_gate_exps"
-        down_base_key = f"{base_key}.ffn_down_exps"
-        max_experts_count = -1
-        
-        while self.has_tensor(f"{up_base_key}.{max_experts_count+1}.weight"):
-            max_experts_count += 1
-        if max_experts_count == -1:
-            raise ValueError(f"No experts found for key {base_key}")
-            
-        # Initialize empty lists to store tensors for each projection type
-        up_weights = []
-        gate_weights = []
-        down_weights = []
-
-        up_scales = []
-        gate_scales = []
-        down_scales = []
-
-        up_zeros = []
-        gate_zeros = []
-        down_zeros = []
-        
-        for expert_id in range(max_experts_count+1):
-            up_key = f"{up_base_key}.{expert_id}.weight"
-            gate_key = f"{gate_base_key}.{expert_id}.weight"
-            down_key = f"{down_base_key}.{expert_id}.weight"
-
-            up_scale_key = f"{up_base_key}.{expert_id}.scale"
-            gate_scale_key = f"{gate_base_key}.{expert_id}.scale"
-            down_scale_key = f"{down_base_key}.{expert_id}.scale"
-
-            up_zeros_key = f"{up_base_key}.{expert_id}.qzeros"
-            gate_zeros_key = f"{gate_base_key}.{expert_id}.qzeros"
-            down_zeros_key = f"{down_base_key}.{expert_id}.qzeros"
-            
-            up_tensor = self.load_tensor(up_key, device).numpy()
-            gate_tensor = self.load_tensor(gate_key, device).numpy()
-            down_tensor = self.load_tensor(down_key, device).numpy()
-
-            up_scale_tensor = self.load_tensor(up_scale_key, device).numpy()
-            gate_scale_tensor = self.load_tensor(gate_scale_key, device).numpy()
-            down_scale_tensor = self.load_tensor(down_scale_key, device).numpy()
-
-            up_zeros_tensor = self.load_tensor(up_zeros_key, device).numpy()
-            gate_zeros_tensor = self.load_tensor(gate_zeros_key, device).numpy()
-            down_zeros_tensor = self.load_tensor(down_zeros_key, device).numpy()
-
-            up_weights.append(up_tensor)
-            gate_weights.append(gate_tensor)
-            down_weights.append(down_tensor)
-
-            up_scales.append(up_scale_tensor)
-            gate_scales.append(gate_scale_tensor)
-            down_scales.append(down_scale_tensor)
-
-            up_zeros.append(up_zeros_tensor)
-            gate_zeros.append(gate_zeros_tensor)
-            down_zeros.append(down_zeros_tensor)
-                
-        return {
-            "up_weight": up_weights,
-            "gate_weight": gate_weights,
-            "down_weight": down_weights,
-            "up_scale": up_scales,
-            "gate_scale": gate_scales,
-            "down_scale": down_scales,
-            "up_zeros": up_zeros,
-            "gate_zeros": gate_zeros,
-            "down_zeros": down_zeros,
-        }
-
-    def has_tensor(self, name: str):
-        return name in self.tensor_file_map
 class AWQConfig(QuantizationConfig):
     """Config class for AWQ.
 
@@ -838,7 +694,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
-    ):  
+    ):
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -873,8 +729,8 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
 
-        num_groups_w13 = hidden_size // self.quant_config.group_size
-        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size
+        num_groups_w13 = hidden_size // layer.group_size
+        num_groups_w2 = intermediate_size_per_partition // layer.group_size
 
         # WEIGHT_SCALES
         # Allocate 2 scales for w1 and w3 respectively.
@@ -899,34 +755,75 @@ class AWQMoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_ZERO_POINT
         # Allocate 2 zero points for w1 and w3 respectively.
-        w13_qzeros = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                num_groups_w13,
-                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_qzeros", w13_qzeros)
-        set_weight_attrs(w13_qzeros, extra_weight_attrs)
-
-        w2_qzeros = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                num_groups_w2,
-                hidden_size // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_qzeros", w2_qzeros)
-        set_weight_attrs(w2_qzeros, extra_weight_attrs)
-
-        device = layer.w13_qweight.device
         if not _is_npu:
-            layer.workspace = marlin_make_workspace(device, 4)
+            w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_qzeros", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
 
+            w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_qzeros", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
+            device = layer.w13_qweight.device
+            layer.workspace = marlin_make_workspace(device, 4)
+        else:
+            buff_w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("buff_w13_qzeros", buff_w13_qzeros)
+            w13_qzeros = torch.nn.Parameter(
+                buff_w13_qzeros.data.view(torch.int32)[:num_experts // 4,...].view(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_qzeros", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+            buff_w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size,
+                    dtype=torch.float16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("buff_w2_qzeros", buff_w2_qzeros)
+            w2_qzeros = torch.nn.Parameter(
+                buff_w2_qzeros.data.view(torch.int32)[:num_experts // 4,...].view(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.quant_config.pack_factor,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_qzeros", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
+            
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
@@ -1036,60 +933,193 @@ class AWQMoEAscendMethod(AWQMoEMethod):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
 
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        group_size = self.quant_config.group_size
+        group_size_div_factor = 1
+        while intermediate_size_per_partition % group_size or hidden_size % group_size:
+            group_size = group_size // 2
+            group_size_div_factor = group_size_div_factor * 2
+            assert group_size >= 32
+        layer.group_size = group_size
+        layer.group_size_div_factor = group_size_div_factor
+        assert "weight_loader" in extra_weight_attrs
+        weight_loader = extra_weight_attrs["weight_loader"]
+        wrapped_weight_loader = AWQMoEAscendMethod.get_weight_loader(layer, weight_loader)
+        extra_weight_attrs["weight_loader"] = wrapped_weight_loader 
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs
+        )
+    
+    @staticmethod
+    def get_weight_loader(layer, weight_loader):
+        def moe_awq_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ):
+            # repeat the qzeros/scales to fit new group size
+            if (
+                layer.group_size_div_factor > 1
+                and "qzeros" in weight_name
+                or "scales" in weight_name
+            ):
+                loaded_weight = loaded_weight.repeat_interleave(
+                    layer.group_size_div_factor, 0
+                )
+            weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
+
+        return moe_awq_weight_loader
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
-        w13_qzeros_list = []
-        w2_qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            w13_qzeros_list.append(
-                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w2_qzeros_list.append(
-                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w13_qweight_tmp.bitwise_or_(
-                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-            w2_qweight_tmp.bitwise_or_(
-                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
+        ###
+        w13_qweight_tmp = layer.w13_qweight.data.view(torch.uint8).view(-1,1)
+        shifter = torch.tensor([1, 16], dtype=torch.uint8, device=w13_qweight_tmp.device)
+        w13_qweight_tmp = (w13_qweight_tmp // shifter)
+        w13_qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+        w13_qweight_tmp = w13_qweight_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w13_qweight_tmp = w13_qweight_tmp[...,0] + w13_qweight_tmp[...,1] * 16
+        w13_qweight_tmp = w13_qweight_tmp.view(torch.int32).view(layer.w13_qweight.data.shape)
 
-        w13_qweight_tmp.bitwise_xor_(0x88888888)
-        w2_qweight_tmp.bitwise_xor_(0x88888888)
+        ###
+        w2_qweight_tmp = layer.w2_qweight.data.view(torch.uint8).view(-1,1)
+        # shifter = torch.tensor([1, 16], dtype=torch.uint8, device=w2_qweight_tmp.device)
+        w2_qweight_tmp = (w2_qweight_tmp // shifter)
+        w2_qweight_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F).bitwise_xor_(0x0808080808080808)
+        w2_qweight_tmp = w2_qweight_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w2_qweight_tmp = w2_qweight_tmp[...,0] + w2_qweight_tmp[...,1] * 16
+        w2_qweight_tmp = w2_qweight_tmp.view(torch.int32).view(layer.w2_qweight.data.shape)
 
-        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
+        if useCustomOps:
+            w13_qweight_tmp = w13_qweight_tmp.reshape(w13_qweight_tmp.shape[0],w13_qweight_tmp.shape[1]//16,16,w13_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+            w2_qweight_tmp = w2_qweight_tmp.reshape(w2_qweight_tmp.shape[0],w2_qweight_tmp.shape[1]//16,16,w2_qweight_tmp.shape[2]//2,2).permute(0,1,3,2,4).contiguous()
+
+        ###
+        w13_qzeros_tmp = layer.w13_qzeros.data.view(torch.int8).view(-1,1)
+        shifter = torch.tensor([1, 16], dtype=torch.int8, device=w13_qzeros_tmp.device)
+        w13_qzeros_tmp = (w13_qzeros_tmp // shifter)
+        w13_qzeros_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F)
+        w13_qzeros_tmp = w13_qzeros_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
+        w13_qzeros_tmp = w13_qzeros_tmp.reshape(
             layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
         )
-        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
+
+        ###
+        w2_qzeros_tmp = layer.w2_qzeros.data.view(torch.int8).view(-1,1)
+        # shifter = torch.tensor([1, 16], dtype=torch.int8, device=w2_qzeros_tmp.device)
+        w2_qzeros_tmp = (w2_qzeros_tmp // shifter)
+        w2_qzeros_tmp.view(-1,8).view(torch.int64).bitwise_and_(0x0F0F0F0F0F0F0F0F)
+        w2_qzeros_tmp = w2_qzeros_tmp.view(-1,2,4).permute(0,2,1).contiguous()
+        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
+        w2_qzeros_tmp = w2_qzeros_tmp.reshape(
             layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
         )
-        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+
+        if useCustomOps:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(torch.float16)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(torch.float16)
+        else:
+            w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
+            w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
+        
+        layer.w13_qweight.data = layer.w13_qweight.data.view(w13_qweight_tmp.shape).copy_(w13_qweight_tmp)
+        layer.w2_qweight.data = layer.w2_qweight.data.view(w2_qweight_tmp.shape).copy_(w2_qweight_tmp)
+        layer.buff_w13_qzeros.data = layer.buff_w13_qzeros.data.view(w13_qzeros_tmp.dtype).view(w13_qzeros_tmp.shape).copy_(w13_qzeros_tmp)
+        layer.buff_w2_qzeros.data = layer.buff_w2_qzeros.data.view(w2_qzeros_tmp.dtype).view(w2_qzeros_tmp.shape).copy_(w2_qzeros_tmp)
 
         layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
+            "w13_qzeros", layer.buff_w13_qzeros
         )
         layer.register_parameter(
-            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
+            "w2_qzeros", layer.buff_w2_qzeros
         )
-        layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-        )
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+
+    @staticmethod
+    def custom_moe(
+        hidden_states: torch.Tensor,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        w13_offset = kwargs.get("w13_offset", None)
+        w2_offset = kwargs.get("w2_offset", None)
+        group_size = kwargs.get("group_size", 64)
+
+        original_shape = hidden_states.shape
+        if len(original_shape) == 3:
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        if hidden_states.shape[0]==1:
+            final_hidden_states = custom_ops_qujing.npu_moe_ffn(hidden_states,
+                            w13, w13_scale,
+                            w2, w2_scale,
+                            topk_ids.view(-1),
+                            topk_ids.view(-1),
+                            topk_ids.view(-1,top_k),
+                            topk_weights,
+                            group_size,
+                            top_k,
+                            w13_offset=w13_offset,
+                            w2_offset=w2_offset)
+        else:
+            expanded_expert_idx, sorted_row_idx = torch.sort(topk_ids.view(-1).float())
+            _, expanded_row_idx = torch.sort(sorted_row_idx.float())
+            final_hidden_states = custom_ops_qujing.npu_moe_ffn(hidden_states,
+                                        w13, w13_scale,
+                                        w2, w2_scale,
+                                        expanded_expert_idx.int(),
+                                        (sorted_row_idx/top_k).int(),
+                                        expanded_row_idx.view(-1,top_k).int(),
+                                        topk_weights,
+                                        group_size,
+                                        top_k,
+                                        w13_offset=w13_offset,
+                                        w2_offset=w2_offset)
+        if len(original_shape) == 3:
+            final_hidden_states = final_hidden_states.view(original_shape)
+        return final_hidden_states
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ) -> torch.Tensor:
+        hidden_states = custom_ops_qujing.npu_moe_without_routing_ffn(hidden_states,
+                layer.w13_qweight, layer.w13_scales,
+                layer.w2_qweight, layer.w2_scales,
+                group_list,
+                layer.group_size,
+                w13_offset=layer.w13_qzeros,
+                w2_offset=layer.w2_qzeros)
+        return hidden_states
 
     def apply(
         self,
@@ -1108,7 +1138,8 @@ class AWQMoEAscendMethod(AWQMoEMethod):
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
+        # output = npu_fused_experts(
+        output = AWQMoEAscendMethod.custom_moe(
             hidden_states=x,
             w13=layer.w13_qweight,
             w13_scale=layer.w13_scales,
@@ -1120,9 +1151,9 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
             use_wna16=True,
+            group_size=layer.group_size
         )
         return StandardCombineInput(hidden_states=output)
-
 
 # Register fake implementations for torch.compile support
 if _is_cuda:
