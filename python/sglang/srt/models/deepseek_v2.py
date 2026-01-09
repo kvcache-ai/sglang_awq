@@ -54,7 +54,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
+from sglang.srt.layers.attention.npu_ops.mla_preprocess_ import (
     NPUFusedMLAPreprocess,
     is_mla_preprocess_enabled,
 )
@@ -217,6 +217,7 @@ elif _is_npu:
     import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
+    import custom_ops_qujing
 
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_decomposition as awq_dequantize,
@@ -457,6 +458,7 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         self.tp_size = tp_size
 
+        quant_config.mla_tag = "shared_gate_up_proj"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -466,6 +468,7 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        quant_config.mla_tag = "shared_down_proj"
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -476,6 +479,7 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        quant_config.mla_tag = None
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -1268,6 +1272,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
+            quant_config.mla_tag = "fused_qkv_a_proj_with_mqa"
+            quant_config.mla_q_lora_rank = self.q_lora_rank
             self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
@@ -1275,7 +1281,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
+            quant_config.mla_q_lora_rank = None
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            quant_config.mla_tag = "q_b_proj"
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1285,6 +1293,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
+            quant_config.mla_tag = None
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1473,7 +1482,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.is_mla_preprocess_enabled = is_mla_preprocess_enabled()
         if self.is_mla_preprocess_enabled:
             assert (
-                quant_config is None or quant_config.get_name() == "w8a8_int8"
+                quant_config is None or quant_config.get_name() == "w8a8_int8" or quant_config.get_name() == "awq"
             ), "MLA Preprocess only works with Unquant or W8A8Int8"
             self.mla_preprocess = None
 
@@ -1576,23 +1585,27 @@ class DeepseekV2AttentionMLA(nn.Module):
                     positions, hidden_states, forward_batch, zero_allocator
                 )
             else:
-                # TODO(iforgetmyname): to be separated as a standalone func
-                if self.mla_preprocess is None:
-                    self.mla_preprocess = NPUFusedMLAPreprocess(
-                        self.fused_qkv_a_proj_with_mqa,
-                        self.q_a_layernorm,
-                        self.kv_a_layernorm,
-                        self.q_b_proj,
-                        self.w_kc,
-                        self.rotary_emb,
-                        self.layer_id,
-                        self.num_local_heads,
-                        self.qk_nope_head_dim,
-                        self.qk_rope_head_dim,
+                if self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name() == "awq":
+                    inner_state = self.forward_npu_prepare_bf16(positions, hidden_states, forward_batch, zero_allocator)
+                else:
+                    # TODO(iforgetmyname): to be separated as a standalone func
+                    if self.mla_preprocess is None:
+                        self.mla_preprocess = NPUFusedMLAPreprocess(
+                            self.fused_qkv_a_proj_with_mqa,
+                            self.q_a_layernorm,
+                            self.kv_a_layernorm,
+                            self.q_b_proj,
+                            self.w_kc,
+                            self.rotary_emb,
+                            self,
+                            self.layer_id,
+                            self.num_local_heads,
+                            self.qk_nope_head_dim,
+                            self.qk_rope_head_dim,
+                        )
+                    inner_state = self.mla_preprocess.forward(
+                        positions, hidden_states, forward_batch, zero_allocator
                     )
-                inner_state = self.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
                 inner_state = (*inner_state, None)  # add a position for topk_indices
         elif attn_forward_method == AttnForwardMethod.NPU_MLA_SPARSE:
             inner_state = self.forward_npu_sparse_prepare(
@@ -1633,6 +1646,46 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
         else:
             raise NotImplementedError
+
+    def forward_npu_prepare_bf16(self, positions, hidden_states, forward_batch, zero_allocator):
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.repeat(1, 2)
+        sin = sin.repeat(1, 2)
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+        slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int64)
+
+        (   q_nope_out,
+            q_rope_out,
+            k_cache,
+            v_cache,
+            _,
+            ) = torch_npu.npu_mla_prolog_v2(
+            hidden_states,
+            self.fused_qkv_a_proj_with_mqa.weight1,
+            self.q_b_proj.weight,
+            self.w_kc,
+            self.fused_qkv_a_proj_with_mqa.weight2,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            sin,
+            cos,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            rmsnorm_epsilon_cq = 1e-6,
+            rmsnorm_epsilon_ckv = 1e-6,
+            cache_mode="PA_BSND"
+        )
+        return (
+            q_rope_out,
+            v_cache,
+            q_nope_out,
+            k_cache,
+            forward_batch,
+            zero_allocator,
+            positions,
+        )
 
     def prepare_qkv_latent(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -2123,26 +2176,29 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_piecewise_cuda_graph():
-                # torch dynamo requires out= op was called where output tensor was non-contiguous
-                attn_bmm_output = (
-                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-                    .transpose(0, 1)
-                    .flatten(1, 2)
-                )
+            if _is_npu:
+                attn_bmm_output = custom_ops_qujing.npu_bmm_transpose(attn_output, self.w_vc).view(attn_output.shape[0], self.num_local_heads * self.v_head_dim)
             else:
-                attn_bmm_output = torch.empty(
-                    (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                    dtype=attn_output.dtype,
-                    device=attn_output.device,
-                )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
+                if is_in_piecewise_cuda_graph():
+                    # torch dynamo requires out= op was called where output tensor was non-contiguous
+                    attn_bmm_output = (
+                        torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+                        .transpose(0, 1)
+                        .flatten(1, 2)
+                    )
+                else:
+                    attn_bmm_output = torch.empty(
+                        (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                        dtype=attn_output.dtype,
+                        device=attn_output.device,
+                    )
+                    torch.bmm(
+                        attn_output.transpose(0, 1),
+                        self.w_vc,
+                        out=attn_bmm_output.view(
+                            -1, self.num_local_heads, self.v_head_dim
+                        ).transpose(0, 1),
+                    )
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
@@ -3705,7 +3761,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                    self_attn.w_kc, w_kc.contiguous()#.transpose(1, 2).contiguous().transpose(1, 2)
                 )
                 w_vc = w_vc.contiguous().transpose(1, 2)
                 if _is_npu:

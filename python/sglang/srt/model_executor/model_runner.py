@@ -1679,7 +1679,7 @@ class ModelRunner:
                     int(
                         self.max_total_num_tokens / self.model_config.context_len * 512
                     ),
-                    2048,
+                    1024,
                 ),
                 4096,
             )
