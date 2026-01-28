@@ -448,7 +448,7 @@ class AWQLinearMethod(LinearMethodBase):
             )
             layer.register_parameter("buff_qzeros", buff_qzeros)
             qzeros = PackedvLLMParameter(
-                data=buff_qzeros.data.view(torch.int32)[:buff_qzeros.data.shape[0] // 4,...].view(
+                data=buff_qzeros.data.view(torch.int32).view(-1)[:buff_qzeros.data.numel()//8].view(
                     input_size_per_partition // self.quant_config.group_size,
                     output_size_per_partition // self.quant_config.pack_factor
                 ),

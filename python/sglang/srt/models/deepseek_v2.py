@@ -218,6 +218,7 @@ elif _is_npu:
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
     import custom_ops_qujing
+    import custom_ops_qujing
 
     from sglang.srt.layers.quantization.awq_triton import (
         awq_dequantize_decomposition as awq_dequantize,
@@ -1289,6 +1290,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             if quant_config is not None:
                 quant_config.mla_tag = "q_b_proj"
+            if quant_config is not None:
+                quant_config.mla_tag = "q_b_proj"
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1298,6 +1301,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
+            if quant_config is not None:
+                quant_config.mla_tag = None
             if quant_config is not None:
                 quant_config.mla_tag = None
         else:
