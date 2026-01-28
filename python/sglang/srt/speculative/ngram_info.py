@@ -416,11 +416,11 @@ class NgramVerifyInput(SpecInput):
         is_all_greedy = (
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
-            )
+        # if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+        #     logger.warning(
+        #         "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+        #         "Falling back to greedy verification."
+        #     )
 
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             self._greedy_verify(batch, logits_output)
