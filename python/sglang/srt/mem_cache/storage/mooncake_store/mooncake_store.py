@@ -174,16 +174,16 @@ class MooncakeStore(HiCacheStorage):
                 else None
             )
             # Load configuration with master_server_address prioritized from extra_config if available
-            if (
-                extra_config is not None
-                and extra_config.get("master_server_address") is not None
-            ):
-                # Load from extra_config
-                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-                logger.info(
-                    "Mooncake Configuration loaded from extra_config successfully."
-                )
-            elif envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
+            # if (
+            #     extra_config is not None
+            #     and extra_config.get("master_server_address") is not None
+            # ):
+            #     # Load from extra_config
+            #     self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+            #     logger.info(
+            #         "Mooncake Configuration loaded from extra_config successfully."
+            #     )
+            if envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
                 # Load from config file
                 self.config = MooncakeStoreConfig.from_file()
                 logger.info("Mooncake Configuration loaded from file successfully.")
@@ -200,9 +200,9 @@ class MooncakeStore(HiCacheStorage):
 
             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
             self.extra_backend_tag = None
-            if extra_config and "extra_backend_tag" in extra_config:
-                self.extra_backend_tag = extra_config["extra_backend_tag"]
-                logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
+            # if extra_config and "extra_backend_tag" in extra_config:
+            #     self.extra_backend_tag = extra_config["extra_backend_tag"]
+            #     logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
 
             # Check server status
             if self.config.check_server:
@@ -305,6 +305,7 @@ class MooncakeStore(HiCacheStorage):
             "page_first",
             "page_first_direct",
             "page_head",
+            "page_first_kv_split",
         ], "mooncake store storage backend only support page first or page first direct layout"
         buffer = self.mem_pool_host.kv_buffer
         try:

@@ -679,6 +679,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=True,
             )
             self.v_buffer = torch.empty(
                 (*base_dims, self.qk_rope_head_dim),
@@ -926,6 +927,23 @@ class MLATokenToKVPoolHost(HostKVCache):
                 * self.dtype.itemsize
                 * self.page_size
                 * (self.kv_lora_rank + self.qk_rope_head_dim)
+            )
+            element_size_list = [element_size] * len(ptr_list)
+        elif self.layout in ["page_first_kv_split"]:
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.kv_lora_rank
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+            element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.kv_lora_rank
             )
             element_size_list = [element_size] * len(ptr_list)
         else:

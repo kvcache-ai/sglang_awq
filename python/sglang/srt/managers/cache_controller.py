@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 from sglang.srt.distributed import (
+    get_world_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -283,6 +284,20 @@ class HiCacheController:
                 and self.storage_config.tp_rank != 0
             )
 
+            # create a new communication group for synchronizing storage operations across TP workers
+            world_group = get_world_group().cpu_group
+            torch.distributed.barrier(group=world_group)
+            group_ranks = torch.distributed.get_process_group_ranks(tp_group)
+            time.sleep(group_ranks[0])
+
+            self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
+            if self.tp_world_size > 1:
+                
+                self.prefetch_tp_group = torch.distributed.new_group(
+                    group_ranks, backend="gloo"
+                )
+            torch.distributed.barrier(group=world_group)
+
             # Use storage backend factory for dynamic backend creation
             from sglang.srt.mem_cache.storage import StorageBackendFactory
 
@@ -305,14 +320,6 @@ class HiCacheController:
             self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
-
-            # create a new communication group for synchronizing storage operations across TP workers
-            self.tp_world_size = torch.distributed.get_world_size(group=tp_group)
-            if self.tp_world_size > 1:
-                group_ranks = torch.distributed.get_process_group_ranks(tp_group)
-                self.prefetch_tp_group = torch.distributed.new_group(
-                    group_ranks, backend="gloo"
-                )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
