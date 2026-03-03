@@ -584,6 +584,8 @@ class HiCacheController:
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
         # Least Common Multiple among heterogeneous tp size
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
 

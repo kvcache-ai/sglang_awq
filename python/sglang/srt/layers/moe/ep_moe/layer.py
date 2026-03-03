@@ -379,7 +379,7 @@ class DeepEPMoE(FusedMoE):
                 device=hidden_states.device,
             )
 
-            if self.w13_weight.dtype == torch.bfloat16:
+            if hasattr(self, 'w13_weight') and self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
@@ -417,7 +417,7 @@ class DeepEPMoE(FusedMoE):
 
             group_list = group_list.to(torch.int64)
 
-            if self.w13_weight.dtype == torch.bfloat16:
+            if hasattr(self, 'w13_weight') and self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )

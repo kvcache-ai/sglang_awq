@@ -1023,28 +1023,41 @@ class SchedulerPPMixin:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
-        send_output_work = self._pp_send_output_to_next_stage(
-            next_first_rank_mb_id,
-            mbs,
-            last_rank_comm_queue,
-            pp_outputs,
-        )
 
-        if mbs[next_mb_id] is not None:
-            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = None
+        def _do_send():
+            return self._pp_send_output_to_next_stage(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+
+        def _do_recv():
+            nonlocal next_pp_outputs, batch_result, d2h_event
+            if mbs[next_mb_id] is not None:
+                with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                    next_pp_outputs = None
+                    if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                        next_pp_outputs = PPProxyTensors(
+                            self._pp_recv_dict_from_prev_stage()
+                        )
                 if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                    next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
-                    )
-            if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                with self.copy_stream_ctx:
-                    self.copy_stream.wait_stream(self.schedule_stream)
-                    batch_result = self._pp_prep_batch_result(
-                        mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
-                    )
-                    d2h_event = torch.cuda.Event()
-                    d2h_event.record(torch.cuda.current_stream())
+                    with self.copy_stream_ctx:
+                        self.copy_stream.wait_stream(self.schedule_stream)
+                        batch_result = self._pp_prep_batch_result(
+                            mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                        )
+                        d2h_event = torch.cuda.Event()
+                        d2h_event.record(torch.cuda.current_stream())
+
+        if self.pp_group.is_last_rank:
+            # Last rank: SEND first (it produces output tokens)
+            send_output_work = _do_send()
+            _do_recv()
+        else:
+            # Non-last rank: RECV first (receive upstream output before forwarding)
+            _do_recv()
+            send_output_work = _do_send()
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 

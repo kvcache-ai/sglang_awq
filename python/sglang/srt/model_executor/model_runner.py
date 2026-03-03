@@ -387,11 +387,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
-        # Initialize MooncakeTransferEngine
-        self.init_shared_mooncake_transfer_engine()
-
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
+
+        # Initialize MooncakeTransferEngine (must be after init_torch_distributed for NPU device context)
+        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()

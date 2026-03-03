@@ -428,6 +428,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
 
+            self._is_kv_split = False
+
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -481,10 +483,39 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first",
             "page_first_direct",
             "page_head",
-        ], "mooncake store storage backend only support page first or page first direct layout"
-        buffer = self.mem_pool_host.kv_buffer
+            "page_first_kv_split",
+        ], "mooncake store storage backend only support page first, page first direct, or page first kv split layout"
+
+        self._is_kv_split = self.mem_pool_host.layout == "page_first_kv_split"
+
         try:
-            super().register_buffer(buffer)
+            if self._is_kv_split:
+                # Register k_buffer and v_buffer separately for RDMA
+                k_buf = self.mem_pool_host.k_buffer
+                ret_code = self.store.register_buffer(
+                    k_buf.data_ptr(), k_buf.numel() * k_buf.element_size()
+                )
+                if ret_code:
+                    logger.error(
+                        f"Failed to register k_buffer, error code: {ret_code}"
+                    )
+                    raise RuntimeError(
+                        f"Failed to register k_buffer to Mooncake Store, error code: {ret_code}"
+                    )
+                v_buf = self.mem_pool_host.v_buffer
+                ret_code = self.store.register_buffer(
+                    v_buf.data_ptr(), v_buf.numel() * v_buf.element_size()
+                )
+                if ret_code:
+                    logger.error(
+                        f"Failed to register v_buffer, error code: {ret_code}"
+                    )
+                    raise RuntimeError(
+                        f"Failed to register v_buffer to Mooncake Store, error code: {ret_code}"
+                    )
+            else:
+                buffer = self.mem_pool_host.kv_buffer
+                super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -518,8 +549,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+        if self._is_kv_split:
+            for key_ in keys:
+                key_list.append(f"{key_}_{self.mla_suffix}_k")
+                key_list.append(f"{key_}_{self.mla_suffix}_v")
+        else:
+            for key_ in keys:
+                key_list.append(f"{key_}_{self.mla_suffix}_k")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -542,7 +578,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for batch_put_from, results is Vector of integers,
             where each element is 0 on success, or a negative value on error
         """
-        if self.is_mla_backend:
+        if self.is_mla_backend and not self._is_kv_split:
             return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
         else:
             if self.storage_config.should_split_heads:
@@ -726,7 +762,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         end_time = time.perf_counter()
 
-        if self.is_mla_backend:
+        if self.is_mla_backend and not self._is_kv_split:
             key_multiplier = 1
         else:
             key_multiplier = 2
@@ -753,9 +789,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             prefix = self.extra_backend_tag
             keys = [f"{prefix}_{key}" for key in keys]
 
-        if self.is_mla_backend:
+        if self.is_mla_backend and not self._is_kv_split:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
+        elif self.is_mla_backend and self._is_kv_split:
+            query_keys = []
+            for key in keys:
+                query_keys.append(f"{key}_{self.mla_suffix}_k")
+                query_keys.append(f"{key}_{self.mla_suffix}_v")
+            key_multiplier = 2
         else:
             query_keys = []
             if self.storage_config.should_split_heads:
