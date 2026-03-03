@@ -143,10 +143,11 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
+        backup_qsize = cc.ack_backup_queue.qsize() if cc.enable_storage else 0
         qsizes = torch.tensor(
             [
                 len(cc.ack_write_queue),
-                cc.ack_backup_queue.qsize(),
+                backup_qsize,
             ],
             dtype=torch.int,
         )
@@ -174,13 +175,17 @@ class DecodeKVCacheOffloadManager:
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._release_finished_req(req, prefill_offloaded_len)
-                self._trigger_backup(
-                    req,
-                    host_indices,
-                    incremental_tokens,
-                    start_time,
-                    prefill_offloaded_len,
-                )
+                if self.cache_controller.enable_storage:
+                    self._trigger_backup(
+                        req,
+                        host_indices,
+                        incremental_tokens,
+                        start_time,
+                        prefill_offloaded_len,
+                    )
+                else:
+                    # No storage backend, just free host memory
+                    self.decode_host_mem_pool.free(host_indices)
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, prefill_offloaded_len: int):

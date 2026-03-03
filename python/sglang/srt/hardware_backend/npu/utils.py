@@ -77,7 +77,10 @@ def set_default_server_args(args: "ServerArgs"):
     # handles hierarchical cache configs
     if args.enable_hierarchical_cache:
         args.hicache_io_backend = "kernel_ascend"
-        if args.use_mla_backend():
+        if False:  # mooncake now supports page_first_kv_split
+            # mooncake store does not support page_first_kv_split layout
+            args.hicache_mem_layout = "page_first"
+        elif args.use_mla_backend():
             args.hicache_mem_layout = "page_first_kv_split"
         else:
             args.hicache_mem_layout = "page_first_direct"

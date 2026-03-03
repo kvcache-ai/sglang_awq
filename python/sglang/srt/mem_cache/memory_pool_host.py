@@ -921,6 +921,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
             data_page = self.kv_buffer[real_index : real_index + 1, :, :, :, :]
+        elif self.layout == "page_first_kv_split":
+            real_index = index // self.page_size
+            k_page = self.k_buffer[real_index : real_index + 1, :, :, :, :]
+            v_page = self.v_buffer[real_index : real_index + 1, :, :, :, :]
+            if flat:
+                return torch.cat([k_page.flatten(), v_page.flatten()])
+            return torch.cat([k_page, v_page], dim=-1)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         if flat:
@@ -928,6 +935,20 @@ class MLATokenToKVPoolHost(HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        if self.layout == "page_first_kv_split":
+            k_dummy = torch.zeros(
+                (1, self.layer_num, self.page_size, 1, self.kv_lora_rank),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+            v_dummy = torch.zeros(
+                (1, self.layer_num, self.page_size, 1, self.qk_rope_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+            return torch.cat([k_dummy.flatten(), v_dummy.flatten()])
         return torch.zeros(
             (
                 self.layer_num,
@@ -963,6 +984,25 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.page_size,
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        elif self.layout == "page_first_kv_split":
+            real_index = index // self.page_size
+            k_numel = 1 * self.layer_num * self.page_size * 1 * self.kv_lora_rank
+            k_data = data_page[:k_numel]
+            v_data = data_page[k_numel:]
+            self.k_buffer[real_index : real_index + 1, :, :, :, :] = k_data.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.kv_lora_rank,
+            )
+            self.v_buffer[real_index : real_index + 1, :, :, :, :] = v_data.reshape(
+                1,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.qk_rope_head_dim,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1012,6 +1052,42 @@ class MLATokenToKVPoolHost(HostKVCache):
                 * (self.kv_lora_rank + self.qk_rope_head_dim)
             )
             element_size_list = [element_size] * len(ptr_list)
+        elif self.layout in ["page_first_kv_split"]:
+            k_data_ptr = self.k_buffer.data_ptr()
+            v_data_ptr = self.v_buffer.data_ptr()
+            for index in range(0, len(indices), self.page_size):
+                k_ptr = (
+                    k_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.kv_lora_rank
+                    * self.dtype.itemsize
+                )
+                v_ptr = (
+                    v_data_ptr
+                    + indices[index]
+                    * self.layer_num
+                    * self.qk_rope_head_dim
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+            k_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.kv_lora_rank
+            )
+            v_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.qk_rope_head_dim
+            )
+            element_size_list = []
+            for _ in range(0, len(indices), self.page_size):
+                element_size_list.append(k_element_size)
+                element_size_list.append(v_element_size)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
