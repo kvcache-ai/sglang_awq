@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -143,11 +144,10 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
-        backup_qsize = cc.ack_backup_queue.qsize() if cc.enable_storage else 0
         qsizes = torch.tensor(
             [
                 len(cc.ack_write_queue),
-                backup_qsize,
+                cc.ack_backup_queue.qsize(),
             ],
             dtype=torch.int,
         )
@@ -175,17 +175,13 @@ class DecodeKVCacheOffloadManager:
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._release_finished_req(req, prefill_offloaded_len)
-                if self.cache_controller.enable_storage:
-                    self._trigger_backup(
-                        req,
-                        host_indices,
-                        incremental_tokens,
-                        start_time,
-                        prefill_offloaded_len,
-                    )
-                else:
-                    # No storage backend, just free host memory
-                    self.decode_host_mem_pool.free(host_indices)
+                self._trigger_backup(
+                    req,
+                    host_indices,
+                    incremental_tokens,
+                    start_time,
+                    prefill_offloaded_len,
+                )
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, prefill_offloaded_len: int):
@@ -196,7 +192,19 @@ class DecodeKVCacheOffloadManager:
 
         # Free the incremental part of the request
         self.token_to_kv_pool_allocator.free(kv_indices)
-        self.req_to_token_pool.free(req.req_pool_idx)
+
+        # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
+        # Without spec v2, start_p == end_p so this is a no-op.
+        start_p, end_p = req.pop_overallocated_kv_cache()
+        if self.page_size > 1:
+            start_p = ceil_align(start_p, self.page_size)
+        if start_p < end_p:
+            overalloc_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_p:end_p
+            ]
+            self.token_to_kv_pool_allocator.free(overalloc_indices)
+
+        self.req_to_token_pool.free(req)
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
 
     def _check_backup_progress(self, finish_count):
