@@ -57,6 +57,7 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     select_top_k_tokens,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
@@ -235,6 +236,15 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:
+            return
+
+        # Skip draft cuda graph on NPU for non-MLA draft models (e.g. EAGLE3 Llama)
+        # NPU ReshapeCacheOperation is not capturable in graph mode for MHA
+        if _is_npu and self.draft_model_runner.model_config.attention_arch != AttentionArch.MLA:
+            logger.info(
+                "Skipping draft cuda graph capture on NPU (draft model uses %s, not MLA)",
+                self.draft_model_runner.model_config.attention_arch,
+            )
             return
 
         Device2DraftCudaGraphRunner = {

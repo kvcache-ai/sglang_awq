@@ -50,6 +50,10 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
+        # Skip NPU fused triton kernel (split_qkv_rmsnorm_rope) for EAGLE3 draft model
+        # It conflicts with HCCL AllReduce in EP mode
+        self.self_attn._force_native_prepare = True
+
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
             2 * self.hidden_size,

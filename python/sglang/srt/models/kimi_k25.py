@@ -786,5 +786,23 @@ class KimiK25ForConditionalGeneration(nn.Module):
             num_groups=text_config.n_group,
         )
 
+    # ---- EAGLE3 speculative decoding support ----
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
+
+    def set_embed(self, embed):
+        if hasattr(self.language_model, 'set_embed'):
+            self.language_model.set_embed(embed)
+        else:
+            del self.language_model.model.embed_tokens.weight
+            self.language_model.model.embed_tokens.weight = embed
+
+    def set_eagle3_layers_to_capture(self, layer_ids=None):
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
 
 EntryClass = [KimiK25ForConditionalGeneration]

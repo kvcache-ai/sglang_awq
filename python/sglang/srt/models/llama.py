@@ -225,6 +225,7 @@ class LlamaAttention(nn.Module):
             not _is_npu
             or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
             or forward_batch.forward_mode.is_extend()
+            or getattr(self, "_force_native_prepare", False)
         ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
