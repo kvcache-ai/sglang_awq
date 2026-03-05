@@ -2028,10 +2028,10 @@ class DeepseekV2Model(nn.Module):
             with ctx:
                 if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = tensor_model_parallel_all_gather(
-                            hidden_states + residual, dim=0
-                        )
-                        aux_hidden_states.append(aux_hidden_state)
+                        # [FIX] Skip AllGather in EP+DP mode — each DP rank's draft model
+                        # only needs local hidden_states. The AllGather across all EP ranks
+                        # causes HCCL conflicts with DeepEP low_latency dispatch (layer 2 hang).
+                        aux_hidden_states.append(hidden_states + residual)
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
