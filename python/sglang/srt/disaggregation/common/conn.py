@@ -317,9 +317,12 @@ class CommonKVManager(BaseKVManager):
         elif (
             num_kv_layers < dst_num_total_layers
             and dst_num_total_layers % num_kv_layers != 0
+            and self.pp_size <= 1
         ):
             # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
             # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
+            # Only applies when PP is not used; with PP, fewer src layers is due to
+            # pipeline partitioning, not draft model mismatch.
             multiplier_ratio = dst_num_total_layers // num_kv_layers
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             v_ptr_offset = num_kv_layers * multiplier_ratio

@@ -32,7 +32,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+from sglang.srt.utils import format_tcp_address, is_npu, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +264,8 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend:
+        if self.is_mla_backend and not is_npu():
+            # CUDA MLA: combined KV buffer, N pointers per N layers
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
@@ -276,12 +277,60 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
+        elif is_npu() and self.is_mla_backend:
+            # Ascend NPU MLA: K and V stored in separate contiguous tensors.
+            # src layout: [K_0..K_{n-1}, V_0..V_{n-1}] (2n pointers)
+            # dst layout: [K_main_0..K_main_{M-1}, V_main_0..V_main_{M-1},
+            #              K_draft_0.., V_draft_0..] (2M + 2D pointers)
+            # K_main pointers are evenly spaced (from one contiguous tensor),
+            # so we detect the K/V boundary by finding where the stride breaks.
+            num_kv_layers = len(src_data_ptrs) // 2
+            start_layer = self.kv_args.prefill_start_layer
+            end_layer = start_layer + num_kv_layers
+            src_k_ptrs = src_data_ptrs[:num_kv_layers]
+            src_v_ptrs = src_data_ptrs[num_kv_layers:]
+            layers_current_pp_stage = num_kv_layers
+
+            if len(src_data_ptrs) == len(dst_data_ptrs):
+                # No PP or same structure: 1:1 mapping
+                dst_k_ptrs = dst_data_ptrs[:num_kv_layers]
+                dst_v_ptrs = dst_data_ptrs[num_kv_layers:]
+            else:
+                # PP mode: find dst V_main offset by detecting K/V address
+                # boundary. K_main pointers come from a single contiguous
+                # tensor, so they have a constant stride between layers.
+                dst_v_offset = len(dst_data_ptrs) // 2  # fallback
+                if len(dst_data_ptrs) >= 2:
+                    k_stride = dst_data_ptrs[1] - dst_data_ptrs[0]
+                    for i in range(2, len(dst_data_ptrs)):
+                        if dst_data_ptrs[i] - dst_data_ptrs[i - 1] != k_stride:
+                            dst_v_offset = i
+                            break
+                dst_k_ptrs = dst_data_ptrs[start_layer:end_layer]
+                dst_v_ptrs = dst_data_ptrs[
+                    dst_v_offset + start_layer : dst_v_offset + end_layer
+                ]
+
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    item_lens[layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    item_lens[layers_current_pp_stage + layer_id],
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
         else:
+            # MHA (non-MLA): K and V stored separately, 2N pointers
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
-            # Use correct item lengths for K and V separately
             if layers_current_pp_stage > len(dst_k_ptrs):
                 logger.error(
                     "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
@@ -292,14 +341,14 @@ class MooncakeKVManager(CommonKVManager):
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    item_lens[layer_id],  # K item length
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    item_lens[layers_current_pp_stage + layer_id],  # V item length
+                    item_lens[layers_current_pp_stage + layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
