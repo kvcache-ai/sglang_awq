@@ -10,6 +10,7 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     npu_fused_experts,
 )
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -379,8 +380,6 @@ class AWQLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
-        self.mla_tag = quant_config.mla_tag
-        self.mla_q_lora_rank = quant_config.mla_q_lora_rank
 
     def create_weights(
         self,
@@ -408,19 +407,19 @@ class AWQLinearMethod(LinearMethodBase):
             )
 
         weight_loader = extra_weight_attrs.get("weight_loader")
-        qweight = PackedvLLMParameter(
-            data=torch.empty(
-                input_size_per_partition,
-                output_size_per_partition // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            input_dim=0,
-            output_dim=1,
-            packed_dim=1,
-            packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
-        )
         if not _is_npu:
+            qweight = PackedvLLMParameter(
+                data=torch.empty(
+                    input_size_per_partition,
+                    output_size_per_partition // self.quant_config.pack_factor,
+                    dtype=torch.int32,
+                ),
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                weight_loader=weight_loader,
+            )
             qzeros = PackedvLLMParameter(
                 data=torch.empty(
                     input_size_per_partition // self.quant_config.group_size,
@@ -434,50 +433,79 @@ class AWQLinearMethod(LinearMethodBase):
                 weight_loader=weight_loader,
             )
         else:
-            if self.mla_tag is not None:
-                if self.mla_tag == "fused_qkv_a_proj_with_mqa":
-                    buff_weight1 = torch.empty(
-                        input_size_per_partition,
-                        self.mla_q_lora_rank,
-                        dtype=torch.bfloat16,
-                    )
-                    buff_weight1 = torch_npu.npu_format_cast(buff_weight1,29)
-                    layer.weight1 = buff_weight1
-                    buff_weight2 = torch.empty(
-                        input_size_per_partition,
-                        output_size_per_partition - self.mla_q_lora_rank,
-                        dtype=torch.bfloat16,
-                    )
-                    buff_weight2 = torch_npu.npu_format_cast(buff_weight2,29)
-                    layer.weight2 = buff_weight2
-                else:
-                    buff_weight = torch.empty(
-                        input_size_per_partition,
-                        output_size_per_partition,
-                        dtype=torch.bfloat16,
-                    )
-                    buff_weight = torch_npu.npu_format_cast(buff_weight,29)
-                    layer.weight = buff_weight
-            buff_qzeros = torch.nn.Parameter(
-                torch.empty(
-                    input_size_per_partition // self.quant_config.group_size,
+            if is_mla_preprocess_enabled() and (
+                                            "fused_qkv_a_proj_with_mqa" in layer.prefix
+                                            or "q_b_proj" in layer.prefix
+                                            or "gate_up_proj" in layer.prefix
+                                            or "down_proj" in layer.prefix):
+                buff_weight = torch.empty(
+                    input_size_per_partition,
                     output_size_per_partition,
-                    dtype=torch.float16,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("buff_qzeros", buff_qzeros)
-            qzeros = PackedvLLMParameter(
-                data=buff_qzeros.data.view(torch.int32).view(-1)[:buff_qzeros.data.numel()//8].view(
-                    input_size_per_partition // self.quant_config.group_size,
-                    output_size_per_partition // self.quant_config.pack_factor
-                ),
-                input_dim=0,
-                output_dim=1,
-                packed_dim=1,
-                packed_factor=self.quant_config.pack_factor,
-                weight_loader=weight_loader,
-            )        
+                    dtype=torch.bfloat16,
+                )
+                layer.buff_weight = buff_weight
+                if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+                    layer.weightNz1 = custom_ops_qujing.npu_make_nz_subtensor(buff_weight, 0, (input_size_per_partition, layer.q_lora_rank), (layer.q_lora_rank, 1))
+                    layer.weightNz2 = custom_ops_qujing.npu_make_nz_subtensor(buff_weight, input_size_per_partition * layer.q_lora_rank, (input_size_per_partition, output_size_per_partition - layer.q_lora_rank), (output_size_per_partition - layer.q_lora_rank, 1))
+                else:
+                    layer.weightNz = custom_ops_qujing.npu_make_nz_subtensor(buff_weight, 0, (input_size_per_partition, output_size_per_partition), (output_size_per_partition, 1))
+                
+                qweight = PackedvLLMParameter(
+                    data=buff_weight.view(torch.int32).view(-1)[:buff_weight.numel()//8].view(
+                        input_size_per_partition,
+                        output_size_per_partition // self.quant_config.pack_factor
+                    ),
+                    input_dim=0,
+                    output_dim=1,
+                    packed_dim=1,
+                    packed_factor=self.quant_config.pack_factor,
+                    weight_loader=weight_loader,
+                )
+                qzeros = PackedvLLMParameter(
+                    data=torch.empty(
+                        input_size_per_partition // self.quant_config.group_size,
+                        output_size_per_partition // self.quant_config.pack_factor,
+                        dtype=torch.int32,
+                    ),
+                    input_dim=0,
+                    output_dim=1,
+                    packed_dim=1,
+                    packed_factor=self.quant_config.pack_factor,
+                    weight_loader=weight_loader,
+                )
+            else:
+                qweight = PackedvLLMParameter(
+                    data=torch.empty(
+                        input_size_per_partition,
+                        output_size_per_partition // self.quant_config.pack_factor,
+                        dtype=torch.int32,
+                    ),
+                    input_dim=0,
+                    output_dim=1,
+                    packed_dim=1,
+                    packed_factor=self.quant_config.pack_factor,
+                    weight_loader=weight_loader,
+                )
+                buff_qzeros = torch.nn.Parameter(
+                    torch.empty(
+                        input_size_per_partition // self.quant_config.group_size,
+                        output_size_per_partition,
+                        dtype=torch.float16,
+                    ),
+                    requires_grad=False,
+                )
+                layer.register_parameter("buff_qzeros", buff_qzeros)
+                qzeros = PackedvLLMParameter(
+                    data=buff_qzeros.data.view(torch.int32).view(-1)[:buff_qzeros.data.numel()//8].view(
+                        input_size_per_partition // self.quant_config.group_size,
+                        output_size_per_partition // self.quant_config.pack_factor
+                    ),
+                    input_dim=0,
+                    output_dim=1,
+                    packed_dim=1,
+                    packed_factor=self.quant_config.pack_factor,
+                    weight_loader=weight_loader,
+                )        
 
         scales = GroupQuantScaleParameter(
             data=torch.empty(
@@ -676,19 +704,21 @@ class AWQLinearAscendMethod(AWQLinearMethod):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.mla_tag is not None:
-            if self.mla_tag == "fused_qkv_a_proj_with_mqa":
-                weight_tmp = awq_dequantize(layer.qweight.data, layer.scales.data, layer.qzeros.data)
-                weight_tmp1 = weight_tmp[:, : self.mla_q_lora_rank].contiguous()
-                weight_tmp2 = weight_tmp[:, self.mla_q_lora_rank :].contiguous()
-                weight_tmp1 = torch_npu.npu_format_cast(weight_tmp1, 29)
-                weight_tmp2 = torch_npu.npu_format_cast(weight_tmp2, 29)
-                layer.weight1.copy_(weight_tmp1)
-                layer.weight2.copy_(weight_tmp2)
-            else:
-                weight_tmp = awq_dequantize(layer.qweight.data, layer.scales.data, layer.qzeros.data).contiguous()
-                weight_tmp = torch_npu.npu_format_cast(weight_tmp, 29)
-                layer.weight.copy_(weight_tmp)
+        if is_mla_preprocess_enabled() and "fused_qkv_a_proj_with_mqa" in layer.prefix:
+            weight_tmp = awq_dequantize(layer.qweight.data, layer.scales.data, layer.qzeros.data)
+            weight_tmp1 = weight_tmp[:, : layer.q_lora_rank].contiguous()
+            weight_tmp2 = weight_tmp[:, layer.q_lora_rank :].contiguous()
+            weight_tmp1 = torch_npu.npu_format_cast(weight_tmp1, 29)
+            weight_tmp2 = torch_npu.npu_format_cast(weight_tmp2, 29)
+            layer.weightNz1.copy_(weight_tmp1)
+            layer.weightNz2.copy_(weight_tmp2)
+        elif is_mla_preprocess_enabled() and (
+                                            "q_b_proj" in layer.prefix
+                                            or "gate_up_proj" in layer.prefix
+                                            or "down_proj" in layer.prefix):
+            weight_tmp = awq_dequantize(layer.qweight.data, layer.scales.data, layer.qzeros.data).contiguous()
+            weight_tmp = torch_npu.npu_format_cast(weight_tmp, 29)
+            layer.weightNz.copy_(weight_tmp)
         else:
             ###
             qweight_tmp = layer.qweight.data.view(torch.uint8).view(-1,1)
@@ -723,17 +753,19 @@ class AWQLinearAscendMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.mla_tag is not None:
-            if self.mla_tag == "fused_qkv_a_proj_with_mqa":
-                weight1 = layer.weight1
-                weight2 = layer.weight2
+        if is_mla_preprocess_enabled() and "fused_qkv_a_proj_with_mqa" in layer.prefix:
+                weight1 = layer.weightNz1
+                weight2 = layer.weightNz2
                 out_shape = x.shape[:-1] + (weight1.shape[-1] + weight2.shape[-1],)
                 reshaped_x = x.reshape(-1, x.shape[-1])
                 out1 = torch.matmul(reshaped_x, weight1)
                 out2 = torch.matmul(reshaped_x, weight2)
                 out = torch.cat((out1, out2), dim=-1)
-            else:
-                weight = layer.weight
+        elif is_mla_preprocess_enabled() and (
+                                            "q_b_proj" in layer.prefix
+                                            or "gate_up_proj" in layer.prefix
+                                            or "down_proj" in layer.prefix):
+                weight = layer.weightNz
                 out_shape = x.shape[:-1] + (weight.shape[-1],)
                 reshaped_x = x.reshape(-1, x.shape[-1])
                 out = torch.matmul(reshaped_x, weight)

@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+# import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -46,6 +47,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -193,8 +195,6 @@ class DeepseekV2MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
-        if quant_config is not None:
-            quant_config.mla_tag = "shared_gate_up_proj"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -204,8 +204,6 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
-        if quant_config is not None:
-            quant_config.mla_tag = "shared_down_proj"
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -216,8 +214,8 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
-        if quant_config is not None:
-            quant_config.mla_tag = None
+        # if quant_config is not None:
+        #     quant_config.mla_tag = None
         if not hasattr(self.gate_up_proj, "weight") and hasattr(
             self.gate_up_proj, "weight_packed"
         ):
@@ -1106,21 +1104,15 @@ class DeepseekV2AttentionMLA(
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
-            if quant_config is not None:
-                quant_config.mla_tag = "fused_qkv_a_proj_with_mqa"
-                quant_config.mla_q_lora_rank = self.q_lora_rank
             self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                q_lora_rank = self.q_lora_rank,
             )
-            if quant_config is not None:
-                quant_config.mla_q_lora_rank = None
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            if quant_config is not None:
-                quant_config.mla_tag = "q_b_proj"
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1130,8 +1122,6 @@ class DeepseekV2AttentionMLA(
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
             )
-            if quant_config is not None:
-                quant_config.mla_tag = None
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1396,7 +1386,7 @@ class DeepseekV2AttentionMLA(
                 layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
-            if hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config") and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name() == "awq":
+            if is_mla_preprocess_enabled():
                 inner_state = self.forward_npu_prepare_bf16(
                     positions, hidden_states, forward_batch, zero_allocator)
             else:
@@ -1459,10 +1449,10 @@ class DeepseekV2AttentionMLA(
             _,
             ) = torch_npu.npu_mla_prolog_v2(
             hidden_states,
-            self.fused_qkv_a_proj_with_mqa.weight1,
-            self.q_b_proj.weight,
+            self.fused_qkv_a_proj_with_mqa.weightNz1,
+            self.q_b_proj.weightNz,
             self.w_kc,
-            self.fused_qkv_a_proj_with_mqa.weight2,
+            self.fused_qkv_a_proj_with_mqa.weightNz2,
             self.q_a_layernorm.weight,
             self.kv_a_layernorm.weight,
             sin,
@@ -2153,6 +2143,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+        # if dist.get_rank() == 0:
+        #     print(self.model)
 
     @property
     def routed_experts_weights_of_layer(self):
