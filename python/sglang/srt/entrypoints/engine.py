@@ -67,6 +67,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.license import LicenseManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
@@ -172,6 +173,9 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
+        self.license_manager = LicenseManager(server_args)
+        self.license_manager.start()
+        self.tokenizer_manager.license_manager = self.license_manager
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
                 scheduler_infos
@@ -476,6 +480,8 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        if hasattr(self, "license_manager") and self.license_manager is not None:
+            self.license_manager.close()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):

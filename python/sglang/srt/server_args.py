@@ -415,6 +415,12 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    license_file: Optional[str] = None
+    license_public_key_path: Optional[str] = None
+    license_state_file: Optional[str] = None
+    license_warning_days: int = 7
+    license_reload_interval_seconds: int = 60
+    license_reminder_interval_seconds: int = 3600
 
     # Data parallelism
     dp_size: int = 1
@@ -3858,6 +3864,42 @@ class ServerArgs:
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
         )
+        parser.add_argument(
+            "--license-file",
+            type=str,
+            default=ServerArgs.license_file,
+            help="Path to the signed license JSON file. When set, the server enforces license validity, warning, grace-period, and expiry checks.",
+        )
+        parser.add_argument(
+            "--license-public-key-path",
+            type=str,
+            default=ServerArgs.license_public_key_path,
+            help="Path to the PEM-encoded Ed25519 public key used to verify the license signature.",
+        )
+        parser.add_argument(
+            "--license-state-file",
+            type=str,
+            default=ServerArgs.license_state_file,
+            help="Optional path for persisting license runtime state such as highest_seen_issue_no, last_verified_at, and anti-rollback clock state. Defaults to <license-file>.state.json.",
+        )
+        parser.add_argument(
+            "--license-warning-days",
+            type=int,
+            default=ServerArgs.license_warning_days,
+            help="Start warning this many days before license not_after. Default is 7.",
+        )
+        parser.add_argument(
+            "--license-reload-interval-seconds",
+            type=int,
+            default=ServerArgs.license_reload_interval_seconds,
+            help="Background and request-path reload interval for refreshing the license file. Default is 60 seconds.",
+        )
+        parser.add_argument(
+            "--license-reminder-interval-seconds",
+            type=int,
+            default=ServerArgs.license_reminder_interval_seconds,
+            help="Minimum interval between repeated warning/grace/expired license log reminders. Default is 3600 seconds.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -5455,6 +5497,13 @@ class ServerArgs:
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
+
+        if self.license_warning_days < 0:
+            raise ValueError("--license-warning-days must be non-negative")
+        if self.license_reload_interval_seconds <= 0:
+            raise ValueError("--license-reload-interval-seconds must be positive")
+        if self.license_reminder_interval_seconds <= 0:
+            raise ValueError("--license-reminder-interval-seconds must be positive")
 
         # Check two batch overlap
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":

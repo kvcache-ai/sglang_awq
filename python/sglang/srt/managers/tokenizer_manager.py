@@ -329,6 +329,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        self.license_manager = None
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -478,6 +479,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        if self.license_manager is not None:
+            request_path = request.url.path if request is not None else None
+            self.license_manager.ensure_request_allowed(request_path)
+
         self.auto_create_handle_loop()
 
         # Normalize the request

@@ -108,6 +108,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.license import LicenseEnforcementError, LicenseManager
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -276,6 +277,12 @@ async def lifespan(fast_api_app: FastAPI):
         warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
+    license_manager = LicenseManager(server_args)
+    license_manager.start()
+    fast_api_app.state.license_manager = license_manager
+    if hasattr(_global_state.tokenizer_manager, "license_manager"):
+        _global_state.tokenizer_manager.license_manager = license_manager
+
     # Add prometheus middleware
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
@@ -375,6 +382,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
+        license_manager.close()
         warmup_thread.join()
 
 
@@ -390,6 +398,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def license_http_middleware(request: Request, call_next):
+    license_manager = getattr(request.app.state, "license_manager", None)
+    if license_manager is None:
+        return await call_next(request)
+
+    try:
+        status = license_manager.ensure_request_allowed(request.url.path)
+        response = await call_next(request)
+        license_manager.attach_headers(response, status)
+        return response
+    except LicenseEnforcementError as exc:
+        response = ORJSONResponse(
+            content={"error": {"message": exc.detail, "type": "license_error"}},
+            status_code=exc.status_code,
+        )
+        license_manager.attach_headers(response, exc.license_status)
+        return response
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -460,6 +488,18 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         status_code=400,
         content=err.model_dump(),
     )
+
+
+@app.exception_handler(LicenseEnforcementError)
+async def license_exception_handler(request: Request, exc: LicenseEnforcementError):
+    response = ORJSONResponse(
+        content={"error": {"message": exc.detail, "type": "license_error"}},
+        status_code=exc.status_code,
+    )
+    license_manager = getattr(request.app.state, "license_manager", None)
+    if license_manager is not None:
+        license_manager.attach_headers(response, exc.license_status)
+    return response
 
 
 async def validate_json_request(raw_request: Request):
@@ -558,6 +598,20 @@ async def health_generate(request: Request) -> Response:
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
+
+
+@app.get("/license/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def license_status(request: Request):
+    license_manager = getattr(request.app.state, "license_manager", None)
+    if license_manager is None:
+        return {
+            "configured": False,
+            "state": "disabled",
+            "allowed": True,
+            "message": "License enforcement is disabled.",
+        }
+    return license_manager.get_status_dict(force=True)
 
 
 @app.get("/get_model_info")

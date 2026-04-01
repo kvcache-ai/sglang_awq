@@ -28,6 +28,28 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_prepare_server_args_with_license_options(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                "--license-file",
+                "/tmp/license.json",
+                "--license-public-key-path",
+                "/tmp/license.pub.pem",
+                "--license-warning-days",
+                "7",
+                "--license-reload-interval-seconds",
+                "30",
+            ]
+        )
+        self.assertEqual(server_args.license_file, "/tmp/license.json")
+        self.assertEqual(
+            server_args.license_public_key_path, "/tmp/license.pub.pem"
+        )
+        self.assertEqual(server_args.license_warning_days, 7)
+        self.assertEqual(server_args.license_reload_interval_seconds, 30)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
