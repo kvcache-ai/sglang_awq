@@ -1218,8 +1218,22 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
         up_scale_ptrs = []
         down_scale_ptrs = []
 
-        if self.load_merged_weight:
+        if self.cpu_save:
+            # cpu_save mode: load original bf16 weights from safetensor and quantize online
+            base_key = f"model.layers.{self.layer_idx}"
+            w = self.safetensor_loader.load_experts(base_key)
 
+            self.gate_proj = torch.cat(w["gate_weight"], dim=0).contiguous().bfloat16()
+            self.up_proj = torch.cat(w["up_weight"], dim=0).contiguous().bfloat16()
+            self.down_proj = torch.cat(w["down_weight"], dim=0).contiguous().bfloat16()
+
+            moe_config.save = True
+            moe_config.load = False
+            moe_config.path = self.cpu_weight_path
+            moe_config.gate_proj = self.gate_proj.data_ptr()
+            moe_config.up_proj = self.up_proj.data_ptr()
+            moe_config.down_proj = self.down_proj.data_ptr()
+        elif self.load_merged_weight:
             base_key = f"blk.{self.layer_idx}"
             w = self.safetensor_loader.load_experts(base_key)
 
@@ -1278,21 +1292,36 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
                 for numa_array in self.down_scales
             ]
 
-        moe_config.load = True
-        moe_config.path = self.cpu_weight_path
+            moe_config.load = True
+            moe_config.path = self.cpu_weight_path
 
-        moe_config.gate_proj = gate_ptr
-        moe_config.up_proj = up_ptr
-        moe_config.down_proj = down_ptr
-        moe_config.gate_projs = gate_ptrs
-        moe_config.up_projs = up_ptrs
-        moe_config.down_projs = down_ptrs
-        moe_config.gate_scales = gate_scale_ptrs
-        moe_config.up_scales = up_scale_ptrs
-        moe_config.down_scales = down_scale_ptrs
+            moe_config.gate_proj = gate_ptr
+            moe_config.up_proj = up_ptr
+            moe_config.down_proj = down_ptr
+            moe_config.gate_projs = gate_ptrs
+            moe_config.up_projs = up_ptrs
+            moe_config.down_projs = down_ptrs
+            moe_config.gate_scales = gate_scale_ptrs
+            moe_config.up_scales = up_scale_ptrs
+            moe_config.down_scales = down_scale_ptrs
 
-        moe_config.save = False
-        moe_config.load = False
+            moe_config.save = False
+            moe_config.load = True
+        else:
+            moe_config.load = True
+            moe_config.path = self.cpu_weight_path
+            moe_config.gate_proj = gate_ptr
+            moe_config.up_proj = up_ptr
+            moe_config.down_proj = down_ptr
+            moe_config.gate_projs = gate_ptrs
+            moe_config.up_projs = up_ptrs
+            moe_config.down_projs = down_ptrs
+            moe_config.gate_scales = gate_scale_ptrs
+            moe_config.up_scales = up_scale_ptrs
+            moe_config.down_scales = down_scale_ptrs
+
+            moe_config.save = False
+            moe_config.load = True
 
         moe_config.hidden_type = ggml_type.BF16
         moe_config.output_type = ggml_type.FP32
@@ -1306,14 +1335,18 @@ class NPU_W8A8CPUMoEMethod(FusedMoEMethodBase):
 
         del moe_config
 
-        if self.load_merged_weight:
+        if self.cpu_save:
+            del self.gate_proj
+            del self.up_proj
+            del self.down_proj
+            del w
+        elif self.load_merged_weight:
             del self.gate_weights
             del self.up_weights
             del self.down_weights
             del self.gate_scales
             del self.up_scales
             del self.down_scales
-
             del w
 
         logger.info(f"Loading W8A8 weights from {self.cpu_weight_path} for layer {self.layer_idx}")

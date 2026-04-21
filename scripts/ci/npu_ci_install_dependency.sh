@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-PIP_INSTALL="pip install --no-cache-dir"
-DEVICE_TYPE=$1
+PIP_INSTALL="pip install"
+DEVICE_TYPE=910b
 
 
 # Install the required dependencies in CI.

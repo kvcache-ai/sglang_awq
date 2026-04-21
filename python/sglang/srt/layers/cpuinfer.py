@@ -121,6 +121,21 @@ class SafeTensorLoader():
         self.file_handle_map.clear()
 
     def load_experts(self, base_key: str, device: str="cpu"):
+        # Try NUMA format first (backward compatibility)
+        up_base_key = f"{base_key}.ffn_up_exps"
+        if self.has_tensor(f"{up_base_key}.0.numa.0.weight"):
+            return self._load_experts_numa_format(base_key, device)
+        # Try AMX format
+        if self.has_tensor(f"{up_base_key}.0.weight"):
+            return self._load_experts_amx_format(base_key, device)
+        # Try original HuggingFace format
+        original_up_base = f"{base_key}.mlp.experts.0.up_proj.weight"
+        if self.has_tensor(f"{original_up_base}"):
+            return self._load_experts_original_format(base_key, device)
+        raise ValueError(f"No experts found for key {base_key} in any format")
+
+    def _load_experts_numa_format(self, base_key: str, device: str="cpu"):
+        """Load experts in NUMA-sharded format"""
         up_base_key = f"{base_key}.ffn_up_exps"
         gate_base_key = f"{base_key}.ffn_gate_exps"
         down_base_key = f"{base_key}.ffn_down_exps"
@@ -128,7 +143,7 @@ class SafeTensorLoader():
         max_experts_count = -1
         while self.has_tensor(f"{up_base_key}.{max_experts_count+1}.numa.{0}.weight"):
             max_experts_count += 1
-        if max_experts_count == 0:
+        if max_experts_count == -1:
             raise ValueError(f"No experts found for key {base_key}")
         while self.has_tensor(f"{up_base_key}.{0}.numa.{max_numa_id+1}.weight"):
             max_numa_id += 1
