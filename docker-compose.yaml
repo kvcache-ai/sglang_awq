@@ -1,0 +1,26 @@
+services:
+  sglang-kml:
+    image: sglang-kml:latest
+    container_name: sglang-kml
+    stdin_open: true
+    tty: true
+    privileged: true
+    network_mode: host
+    ipc: host
+    ulimits:
+      nproc: 65535
+    devices:
+      - /dev/davinci2:/dev/davinci2
+      - /dev/davinci5:/dev/davinci5
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    volumes:
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver
+      - /etc/ascend_install.info:/etc/ascend_install.info
+      - /data:/data
+      - /etc/hccn.conf:/etc/hccn.conf
+      - /tmp/model:/tmp/model
+      - /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi
+      - /home/shangyouren:/home/shangyouren
+    command: /bin/bash
